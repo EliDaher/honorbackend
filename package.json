@@ -1,0 +1,43 @@
+{
+  "name": "render-fastify-backend-template",
+  "version": "1.0.0",
+  "description": "Production-ready Fastify + TypeScript backend template for Render",
+  "main": "dist/server.js",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "fastify",
+    "typescript",
+    "render",
+    "backend",
+    "firebase"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@fastify/compress": "latest",
+    "@fastify/cors": "latest",
+    "@fastify/helmet": "latest",
+    "@fastify/jwt": "latest",
+    "@fastify/rate-limit": "latest",
+    "bcryptjs": "latest",
+    "dotenv": "latest",
+    "fastify": "latest",
+    "firebase-admin": "latest",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "latest",
+    "@types/node": "latest",
+    "tsx": "latest",
+    "typescript": "latest"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
