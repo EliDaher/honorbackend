@@ -6,6 +6,7 @@ const envSchema = z.object({
   PORT: z.coerce.number().default(5000),
   HOST: z.string().default('0.0.0.0'),
   CORS_ORIGIN: z.string().default('http://localhost:3000'),
+  RATE_LIMIT_MAX: z.coerce.number().int().positive().default(1000),
   JWT_SECRET: z.string().min(16, 'JWT_SECRET must be at least 16 characters'),
   JWT_EXPIRES_IN: z.string().default('7d'),
   FIREBASE_DATABASE_URL: z.string().optional(),

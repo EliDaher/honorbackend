@@ -15,7 +15,7 @@ export async function registerSecurityPlugins(app: FastifyInstance) {
   });
 
   await app.register(rateLimit, {
-    max: 120,
+    max: env.RATE_LIMIT_MAX,
     timeWindow: '1 minute'
   });
 
