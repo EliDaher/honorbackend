@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { db } from '../../config/firebase.js';
 import { AppError } from '../../utils/app-error.js';
 import { requireAuth } from '../auth/auth.middleware.js';
+import { recordOpeningInventoryAccounting, recordPaymentAccounting, recordSaleAccounting } from '../accounting/accounting.service.js';
 
 type Currency = 'USD' | 'SYP';
 
@@ -430,10 +431,13 @@ async function addMovement(input: {
   note: string;
 }) {
   const ref = requireDb().ref('inventory/movements').push();
-  await ref.set({
+  const movement = {
+    id: ref.key!,
     ...input,
     createdAt: now()
-  });
+  };
+  await ref.set(movement);
+  return movement;
 }
 
 async function moveProductQuantity(
@@ -508,10 +512,68 @@ async function applySalePayment(saleId: string, input: z.infer<typeof paymentSch
     referenceId: payment.id,
     note: input.note
   });
+  await recordPaymentAccounting({
+    sourceId: payment.id,
+    amount: payment.amount,
+    partyId: payment.customerId || payment.contactId,
+    memo: input.note || 'Sale payment',
+    date: payment.createdAt
+  });
 
   return { sale: enrichSale(nextSale), payment };
 }
 
+async function applyHoldPayment(holdId: string, input: z.infer<typeof paymentSchema>) {
+  const hold = await getHold(holdId);
+  if (!hold) throw new AppError('Hold not found', 404, 'HOLD_NOT_FOUND');
+  const holdCurrency = hold.currency ?? 'USD';
+  if (holdCurrency !== input.currency) throw new AppError('Payment currency must match hold currency', 400, 'CURRENCY_MISMATCH');
+
+  const amountDue = hold.quantitySold * hold.unitPrice;
+  const balanceDue = Math.max(0, amountDue - hold.paidAmount);
+  if (input.amount > balanceDue) throw new AppError('Payment exceeds balance due', 400, 'PAYMENT_EXCEEDS_BALANCE');
+
+  const timestamp = now();
+  const nextHold: Hold = {
+    ...hold,
+    paidAmount: hold.paidAmount + input.amount,
+    status: calculateHoldStatus({
+      ...hold,
+      paidAmount: hold.paidAmount + input.amount
+    }),
+    updatedAt: timestamp
+  };
+  if (nextHold.status === 'settled') nextHold.settledAt = timestamp;
+
+  await requireDb().ref(`inventory/holds/${holdId}`).set(withoutId(nextHold));
+  const payment = await createPaymentRecord({
+    targetType: 'hold',
+    targetId: holdId,
+    customerId: hold.finalCustomerId ?? '',
+    contactId: hold.contactId,
+    amount: money(input.amount, input.currency),
+    note: input.note
+  });
+  await addMovement({
+    productId: hold.productId,
+    type: 'hold_payment',
+    quantity: input.amount,
+    beforeQuantity: balanceDue,
+    afterQuantity: balanceDue - input.amount,
+    referenceType: 'payment',
+    referenceId: payment.id,
+    note: input.note
+  });
+  await recordPaymentAccounting({
+    sourceId: payment.id,
+    amount: payment.amount,
+    partyId: payment.customerId || payment.contactId,
+    memo: input.note || 'Hold payment',
+    date: payment.createdAt
+  });
+
+  return { hold: enrichHold(nextHold), payment };
+}
 async function getInventoryCollections() {
   const [productsSnapshot, holdsSnapshot, contactsSnapshot, salesSnapshot, paymentsSnapshot, categoriesSnapshot, rollsSnapshot, cutsSnapshot] =
     await Promise.all([
@@ -659,6 +721,15 @@ export async function inventoryRoutes(app: FastifyInstance) {
         referenceId: ref.key!,
         note: 'Initial product quantity'
       });
+      if (input.costPrice > 0) {
+        await recordOpeningInventoryAccounting({
+          sourceType: 'product',
+          sourceId: ref.key!,
+          amount: money(input.quantityOnHand * input.costPrice, input.currency),
+          memo: 'Initial product inventory value',
+          date: timestamp
+        });
+      }
     }
 
     return reply.status(201).send({
@@ -912,7 +983,7 @@ export async function inventoryRoutes(app: FastifyInstance) {
     if (nextHold.status === 'settled') nextHold.settledAt = timestamp;
 
     await requireDb().ref(`inventory/holds/${id}`).set(withoutId(nextHold));
-    await addMovement({
+    const saleMovement = await addMovement({
       productId: hold.productId,
       type: 'hold_sell',
       quantity: input.quantity,
@@ -921,6 +992,20 @@ export async function inventoryRoutes(app: FastifyInstance) {
       referenceType: 'hold',
       referenceId: id,
       note: input.note
+    });
+    const product = await getProduct(hold.productId);
+    await recordSaleAccounting({
+      sourceType: 'hold',
+      sourceId: saleMovement.id,
+      sourceAction: 'sold',
+      productId: hold.productId,
+      partyId: nextHold.finalCustomerId || nextHold.contactId,
+      quantity: input.quantity,
+      total: money(input.quantity * hold.unitPrice, hold.currency ?? 'USD'),
+      costPerUnit: product?.costPrice ?? 0,
+      costCurrency: product?.currency ?? hold.currency ?? 'USD',
+      memo: input.note || 'Hold sale settled',
+      date: timestamp
     });
 
     return {
@@ -932,53 +1017,10 @@ export async function inventoryRoutes(app: FastifyInstance) {
   app.post('/holds/:id/payment', async (request) => {
     const { id } = z.object({ id: z.string().min(1) }).parse(request.params);
     const input = paymentSchema.parse(request.body);
-    const hold = await getHold(id);
-    if (!hold) throw new AppError('Hold not found', 404, 'HOLD_NOT_FOUND');
-    const holdCurrency = hold.currency ?? 'USD';
-    if (holdCurrency !== input.currency) throw new AppError('Payment currency must match hold currency', 400, 'CURRENCY_MISMATCH');
-
-    const amountDue = hold.quantitySold * hold.unitPrice;
-    const balanceDue = Math.max(0, amountDue - hold.paidAmount);
-    if (input.amount > balanceDue) throw new AppError('Payment exceeds balance due', 400, 'PAYMENT_EXCEEDS_BALANCE');
-
-    const timestamp = now();
-    const nextHold: Hold = {
-      ...hold,
-      paidAmount: hold.paidAmount + input.amount,
-      status: calculateHoldStatus({
-        ...hold,
-        paidAmount: hold.paidAmount + input.amount
-      }),
-      updatedAt: timestamp
-    };
-    if (nextHold.status === 'settled') nextHold.settledAt = timestamp;
-
-    await requireDb().ref(`inventory/holds/${id}`).set(withoutId(nextHold));
-    const payment = await createPaymentRecord({
-      targetType: 'hold',
-      targetId: id,
-      customerId: hold.finalCustomerId ?? '',
-      contactId: hold.contactId,
-      amount: money(input.amount, input.currency),
-      note: input.note
-    });
-    await addMovement({
-      productId: hold.productId,
-      type: 'hold_payment',
-      quantity: input.amount,
-      beforeQuantity: balanceDue,
-      afterQuantity: balanceDue - input.amount,
-      referenceType: 'payment',
-      referenceId: payment.id,
-      note: input.note
-    });
-
+    const result = await applyHoldPayment(id, input);
     return {
       success: true,
-      data: {
-        hold: enrichHold(nextHold),
-        payment
-      }
+      data: result
     };
   });
 
@@ -1083,6 +1125,18 @@ export async function inventoryRoutes(app: FastifyInstance) {
       referenceId: ref.key!,
       note: input.note
     });
+    await recordSaleAccounting({
+      sourceType: 'sale',
+      sourceId: ref.key!,
+      productId: input.productId,
+      partyId: input.finalCustomerId || input.responsibleContactId,
+      quantity: input.quantity,
+      total,
+      costPerUnit: product.costPrice,
+      costCurrency: product.currency,
+      memo: input.note || 'Direct product sale',
+      date: timestamp
+    });
 
     return reply.status(201).send({
       success: true,
@@ -1119,17 +1173,8 @@ export async function inventoryRoutes(app: FastifyInstance) {
     }
 
     if (input.targetType === 'hold') {
-      const hold = await getHold(input.targetId);
-      if (!hold) throw new AppError('Hold not found', 404, 'HOLD_NOT_FOUND');
-      const payment = await createPaymentRecord({
-        targetType: 'hold',
-        targetId: input.targetId,
-        customerId: hold.finalCustomerId ?? input.customerId,
-        contactId: hold.contactId,
-        amount: money(input.amount, input.currency),
-        note: input.note
-      });
-      return reply.status(201).send({ success: true, data: payment });
+      const result = await applyHoldPayment(input.targetId, input);
+      return reply.status(201).send({ success: true, data: result });
     }
 
     const payment = await createPaymentRecord({
@@ -1139,6 +1184,13 @@ export async function inventoryRoutes(app: FastifyInstance) {
       contactId: input.contactId,
       amount: money(input.amount, input.currency),
       note: input.note
+    });
+    await recordPaymentAccounting({
+      sourceId: payment.id,
+      amount: payment.amount,
+      partyId: payment.customerId || payment.contactId || payment.targetId,
+      memo: input.note || 'Direct payment',
+      date: payment.createdAt
     });
 
     return reply.status(201).send({
@@ -1321,6 +1373,20 @@ export async function inventoryRoutes(app: FastifyInstance) {
       referenceId: cutRef.key!,
       note: input.note
     });
+    if (saleId) {
+      await recordSaleAccounting({
+        sourceType: 'cable_sale',
+        sourceId: saleId,
+        productId: roll.productId,
+        partyId: input.finalCustomerId || input.responsibleContactId,
+        quantity: input.meters,
+        total,
+        costPerUnit: roll.costPerMeter.amount,
+        costCurrency: roll.costPerMeter.currency,
+        memo: input.note || 'Cable sale',
+        date: timestamp
+      });
+    }
 
     return reply.status(201).send({
       success: true,
