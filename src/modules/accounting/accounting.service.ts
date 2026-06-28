@@ -187,6 +187,39 @@ function sourceEntryId(sourceType: string, sourceId: string, sourceAction: strin
   return `${sourceType}_${sourceAction}_${sourceId}`.replace(/[.#$\[\]\/]/g, '_');
 }
 
+export async function deleteJournalEntry(sourceType: string, sourceId: string, sourceAction = 'created') {
+  await requireDb().ref(`accounting/journalEntries/${sourceEntryId(sourceType, sourceId, sourceAction)}`).remove();
+}
+
+export async function updateJournalEntryMetadata(input: {
+  sourceType: string;
+  sourceId: string;
+  sourceAction?: string;
+  memo?: string;
+  partyId?: string;
+}) {
+  const entryRef = requireDb().ref(`accounting/journalEntries/${sourceEntryId(input.sourceType, input.sourceId, input.sourceAction ?? 'created')}`);
+  const snapshot = await entryRef.get();
+  const entry = snapshot.val() as JournalEntry | null;
+  if (!entry) return null;
+
+  const next: JournalEntry = {
+    ...entry,
+    memo: input.memo ?? entry.memo,
+    partyId: input.partyId ?? entry.partyId,
+    lines:
+      input.partyId === undefined
+        ? entry.lines
+        : entry.lines.map((line) => ({
+            ...line,
+            partyId: input.partyId!
+          }))
+  };
+
+  await entryRef.set(next);
+  return next;
+}
+
 function balanceSign(type: AccountType) {
   return type === 'asset' || type === 'expense' ? 1 : -1;
 }
@@ -396,7 +429,18 @@ export async function createExpense(input: {
     createdAt: timestamp
   };
   await ref.set(expense);
-  await postJournalEntry({
+  await postExpenseJournal(expense);
+
+  return expense;
+}
+
+async function getExpense(expenseId: string) {
+  const snapshot = await requireDb().ref(`accounting/expenses/${expenseId}`).get();
+  return snapshot.val() as Expense | null;
+}
+
+async function postExpenseJournal(expense: Expense) {
+  return postJournalEntry({
     sourceType: 'expense',
     sourceId: expense.id,
     sourceAction: expense.paidStatus,
@@ -408,8 +452,39 @@ export async function createExpense(input: {
       { accountId: expense.paidStatus === 'paid' ? accountIds.cash : accountIds.payable, credit: expense.amount.amount, currency: expense.amount.currency, partyId: expense.vendorContactId, description: expense.paidStatus === 'paid' ? 'Expense paid' : 'Expense payable' }
     ]
   });
+}
 
-  return expense;
+export async function updateExpense(expenseId: string, input: {
+  category?: string;
+  vendorContactId?: string;
+  amount?: number;
+  currency?: Currency;
+  paidStatus?: 'paid' | 'unpaid';
+  note?: string;
+}) {
+  const existing = await getExpense(expenseId);
+  if (!existing) throw new AppError('Expense not found', 404, 'EXPENSE_NOT_FOUND');
+
+  const next: Expense = {
+    ...existing,
+    ...input,
+    amount: money(input.amount ?? existing.amount.amount, input.currency ?? existing.amount.currency),
+    paidStatus: input.paidStatus ?? existing.paidStatus
+  };
+
+  await requireDb().ref(`accounting/expenses/${expenseId}`).set(next);
+  await deleteJournalEntry('expense', expenseId, existing.paidStatus);
+  await postExpenseJournal(next);
+  return next;
+}
+
+export async function deleteExpense(expenseId: string) {
+  const existing = await getExpense(expenseId);
+  if (!existing) throw new AppError('Expense not found', 404, 'EXPENSE_NOT_FOUND');
+
+  await requireDb().ref(`accounting/expenses/${expenseId}`).remove();
+  await deleteJournalEntry('expense', expenseId, existing.paidStatus);
+  return { id: expenseId };
 }
 
 async function getProduct(productId: string) {
@@ -453,7 +528,18 @@ export async function createPurchase(input: {
     updatedAt: timestamp
   });
 
-  await postJournalEntry({
+  await postPurchaseJournal(purchase);
+
+  return purchase;
+}
+
+async function getPurchase(purchaseId: string) {
+  const snapshot = await requireDb().ref(`accounting/purchases/${purchaseId}`).get();
+  return snapshot.val() as Purchase | null;
+}
+
+async function postPurchaseJournal(purchase: Purchase) {
+  return postJournalEntry({
     sourceType: 'purchase',
     sourceId: purchase.id,
     sourceAction: purchase.paidStatus,
@@ -465,8 +551,70 @@ export async function createPurchase(input: {
       { accountId: purchase.paidStatus === 'paid' ? accountIds.cash : accountIds.payable, credit: purchase.total.amount, currency: purchase.total.currency, partyId: purchase.supplierContactId, description: purchase.paidStatus === 'paid' ? 'Purchase paid' : 'Purchase payable' }
     ]
   });
+}
 
-  return purchase;
+export async function updatePurchase(purchaseId: string, input: {
+  supplierContactId?: string;
+  quantity?: number;
+  unitCost?: number;
+  currency?: Currency;
+  paidStatus?: 'paid' | 'unpaid';
+  note?: string;
+}) {
+  const existing = await getPurchase(purchaseId);
+  if (!existing) throw new AppError('Purchase not found', 404, 'PURCHASE_NOT_FOUND');
+
+  const product = await getProduct(existing.productId);
+  if (!product) throw new AppError('Product not found', 404, 'PRODUCT_NOT_FOUND');
+
+  const nextCurrency = input.currency ?? existing.total.currency;
+  if ((product.currency ?? 'USD') !== nextCurrency) throw new AppError('Purchase currency must match product currency', 400, 'CURRENCY_MISMATCH');
+
+  const nextQuantity = input.quantity ?? existing.quantity;
+  const nextUnitCost = input.unitCost ?? existing.unitCost.amount;
+  const quantityDelta = nextQuantity - existing.quantity;
+  if (quantityDelta < 0 && (product.quantityOnHand ?? 0) < Math.abs(quantityDelta)) {
+    throw new AppError('Cannot reduce purchase quantity because stock was already used', 400, 'PURCHASE_STOCK_ALREADY_USED');
+  }
+
+  const next: Purchase = {
+    ...existing,
+    supplierContactId: input.supplierContactId ?? existing.supplierContactId,
+    quantity: nextQuantity,
+    unitCost: money(nextUnitCost, nextCurrency),
+    total: money(nextQuantity * nextUnitCost, nextCurrency),
+    paidStatus: input.paidStatus ?? existing.paidStatus,
+    note: input.note ?? existing.note
+  };
+
+  await requireDb().ref(`accounting/purchases/${purchaseId}`).set(next);
+  await requireDb().ref(`inventory/products/${existing.productId}`).update({
+    quantityOnHand: (product.quantityOnHand ?? 0) + quantityDelta,
+    costPrice: nextUnitCost,
+    updatedAt: now()
+  });
+  await deleteJournalEntry('purchase', purchaseId, existing.paidStatus);
+  await postPurchaseJournal(next);
+  return next;
+}
+
+export async function deletePurchase(purchaseId: string) {
+  const existing = await getPurchase(purchaseId);
+  if (!existing) throw new AppError('Purchase not found', 404, 'PURCHASE_NOT_FOUND');
+
+  const product = await getProduct(existing.productId);
+  if (!product) throw new AppError('Product not found', 404, 'PRODUCT_NOT_FOUND');
+  if ((product.quantityOnHand ?? 0) < existing.quantity) {
+    throw new AppError('Cannot delete purchase because its stock was already used', 400, 'PURCHASE_STOCK_ALREADY_USED');
+  }
+
+  await requireDb().ref(`accounting/purchases/${purchaseId}`).remove();
+  await requireDb().ref(`inventory/products/${existing.productId}`).update({
+    quantityOnHand: (product.quantityOnHand ?? 0) - existing.quantity,
+    updatedAt: now()
+  });
+  await deleteJournalEntry('purchase', purchaseId, existing.paidStatus);
+  return { id: purchaseId };
 }
 
 export async function getJournalEntries() {

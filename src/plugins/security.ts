@@ -9,8 +9,12 @@ import { env } from '../config/env.js';
 export async function registerSecurityPlugins(app: FastifyInstance) {
   await app.register(helmet);
 
+  const corsOrigins = env.CORS_ORIGIN.split(',').map((origin) => origin.trim()).filter(Boolean);
+  const corsOrigin = corsOrigins.includes('*') ? '*' : corsOrigins;
+
   await app.register(cors, {
-    origin: env.CORS_ORIGIN.split(',').map((origin) => origin.trim()),
+    origin: corsOrigin,
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     credentials: true
   });
 
