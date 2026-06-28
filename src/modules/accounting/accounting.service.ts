@@ -97,6 +97,16 @@ type Payment = {
   contactId: string;
   amount: Money;
   note: string;
+  date?: string;
+  createdAt: string;
+};
+
+type CustomerDebtInvoice = {
+  id: string;
+  customerId: string;
+  amount: Money;
+  note: string;
+  date: string;
   createdAt: string;
 };
 
@@ -355,6 +365,28 @@ export async function recordPaymentAccounting(input: {
   });
 }
 
+export async function recordCustomerDebtInvoiceAccounting(input: {
+  sourceId: string;
+  amount: Money;
+  partyId: string;
+  memo?: string;
+  date?: string;
+}) {
+  if (input.amount.amount <= 0) return null;
+  return postJournalEntry({
+    sourceType: 'customer_debt_invoice',
+    sourceId: input.sourceId,
+    sourceAction: 'created',
+    memo: input.memo || 'Customer debt invoice',
+    partyId: input.partyId,
+    date: input.date,
+    lines: [
+      { accountId: accountIds.receivable, debit: input.amount.amount, currency: input.amount.currency, partyId: input.partyId, description: 'Customer debt invoice' },
+      { accountId: accountIds.revenue, credit: input.amount.amount, currency: input.amount.currency, partyId: input.partyId, description: 'Manual sales revenue' }
+    ]
+  });
+}
+
 export async function recordOpeningInventoryAccounting(input: {
   sourceType: string;
   sourceId: string;
@@ -595,11 +627,12 @@ export async function getAccountingDashboard() {
 }
 
 async function getInventoryCollections() {
-  const [productsSnapshot, holdsSnapshot, salesSnapshot, paymentsSnapshot, rollsSnapshot] = await Promise.all([
+  const [productsSnapshot, holdsSnapshot, salesSnapshot, paymentsSnapshot, debtInvoicesSnapshot, rollsSnapshot] = await Promise.all([
     requireDb().ref('inventory/products').get(),
     requireDb().ref('inventory/holds').get(),
     requireDb().ref('inventory/sales').get(),
     requireDb().ref('inventory/payments').get(),
+    requireDb().ref('inventory/customerDebtInvoices').get(),
     requireDb().ref('inventory/cableRolls').get()
   ]);
 
@@ -608,6 +641,7 @@ async function getInventoryCollections() {
     holds: collectionToArray<Hold>(holdsSnapshot.val()),
     sales: collectionToArray<Sale>(salesSnapshot.val()),
     payments: collectionToArray<Payment>(paymentsSnapshot.val()),
+    customerDebtInvoices: collectionToArray<CustomerDebtInvoice>(debtInvoicesSnapshot.val()),
     cableRolls: collectionToArray<CableRoll>(rollsSnapshot.val())
   };
 }
@@ -618,7 +652,7 @@ export async function runAccountingBackfill() {
   let createdEntries = 0;
   let skippedEntries = 0;
 
-  async function count(result: Awaited<ReturnType<typeof postJournalEntry>> | Awaited<ReturnType<typeof recordSaleAccounting>> | Awaited<ReturnType<typeof recordPaymentAccounting>> | null) {
+  async function count(result: { created: boolean } | null) {
     if (!result) return;
     if (result.created) createdEntries += 1;
     else skippedEntries += 1;
@@ -684,13 +718,23 @@ export async function runAccountingBackfill() {
     }));
   }
 
+  for (const invoice of collections.customerDebtInvoices) {
+    await count(await recordCustomerDebtInvoiceAccounting({
+      sourceId: invoice.id,
+      amount: invoice.amount,
+      partyId: invoice.customerId,
+      memo: invoice.note || 'Backfilled customer debt invoice',
+      date: invoice.date || invoice.createdAt
+    }));
+  }
+
   for (const payment of collections.payments) {
     await count(await recordPaymentAccounting({
       sourceId: payment.id,
       amount: payment.amount,
       partyId: payment.customerId || payment.contactId || payment.targetId,
       memo: payment.note || `Backfilled ${payment.targetType} payment`,
-      date: payment.createdAt
+      date: payment.date || payment.createdAt
     }));
   }
 
@@ -708,6 +752,7 @@ export async function runAccountingBackfill() {
       cableRolls: collections.cableRolls.length,
       sales: collections.sales.length,
       holds: collections.holds.length,
+      customerDebtInvoices: collections.customerDebtInvoices.length,
       payments: collections.payments.length
     }
   };

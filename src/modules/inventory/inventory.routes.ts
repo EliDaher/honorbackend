@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { db } from '../../config/firebase.js';
 import { AppError } from '../../utils/app-error.js';
 import { requireAuth } from '../auth/auth.middleware.js';
-import { recordOpeningInventoryAccounting, recordPaymentAccounting, recordSaleAccounting } from '../accounting/accounting.service.js';
+import { recordCustomerDebtInvoiceAccounting, recordOpeningInventoryAccounting, recordPaymentAccounting, recordSaleAccounting } from '../accounting/accounting.service.js';
 
 type Currency = 'USD' | 'SYP';
 
@@ -92,7 +92,29 @@ type Payment = {
   contactId: string;
   amount: Money;
   note: string;
+  date?: string;
   createdAt: string;
+};
+
+type CustomerDebtInvoice = {
+  id: string;
+  customerId: string;
+  amount: Money;
+  note: string;
+  date: string;
+  createdAt: string;
+};
+
+type PartyStatementEntry = {
+  id: string;
+  sourceType: 'debt_invoice' | 'sale' | 'hold' | 'payment';
+  sourceId: string;
+  date: string;
+  description: string;
+  currency: Currency;
+  debit?: Money;
+  credit?: Money;
+  runningBalanceByCurrency: Record<Currency, number>;
 };
 
 type CableRoll = {
@@ -142,6 +164,9 @@ type MovementType =
   | 'cable_cut';
 
 const currencySchema = z.enum(['USD', 'SYP']).default('USD');
+const dateSchema = z.string().trim().min(1).refine((value) => !Number.isNaN(Date.parse(value)), {
+  message: 'Invalid date'
+});
 
 const categoryCreateSchema = z.object({
   name: z.string().trim().min(1),
@@ -216,7 +241,8 @@ const holdQuantitySchema = z.object({
 const paymentSchema = z.object({
   amount: z.coerce.number().positive(),
   currency: currencySchema,
-  note: z.string().trim().optional().default('')
+  note: z.string().trim().optional().default(''),
+  date: dateSchema.optional()
 });
 
 const paymentCreateSchema = paymentSchema.extend({
@@ -224,6 +250,13 @@ const paymentCreateSchema = paymentSchema.extend({
   targetId: z.string().trim().min(1),
   customerId: z.string().trim().optional().default(''),
   contactId: z.string().trim().optional().default('')
+});
+
+const customerDebtInvoiceCreateSchema = z.object({
+  amount: z.coerce.number().positive(),
+  currency: currencySchema,
+  date: dateSchema,
+  note: z.string().trim().optional().default('')
 });
 
 const saleCreateSchema = z.object({
@@ -463,9 +496,11 @@ async function moveProductQuantity(
 
 async function createPaymentRecord(input: Omit<Payment, 'id' | 'createdAt'>) {
   const ref = requireDb().ref('inventory/payments').push();
+  const timestamp = now();
   const payment: Omit<Payment, 'id'> = {
     ...input,
-    createdAt: now()
+    date: input.date ?? timestamp,
+    createdAt: timestamp
   };
   await ref.set(payment);
   return { id: ref.key!, ...payment } as Payment;
@@ -499,7 +534,8 @@ async function applySalePayment(saleId: string, input: z.infer<typeof paymentSch
     customerId: sale.finalCustomerId,
     contactId: sale.responsibleContactId,
     amount: money(input.amount, input.currency),
-    note: input.note
+    note: input.note,
+    date: input.date
   });
 
   await addMovement({
@@ -517,7 +553,7 @@ async function applySalePayment(saleId: string, input: z.infer<typeof paymentSch
     amount: payment.amount,
     partyId: payment.customerId || payment.contactId,
     memo: input.note || 'Sale payment',
-    date: payment.createdAt
+    date: payment.date || payment.createdAt
   });
 
   return { sale: enrichSale(nextSale), payment };
@@ -552,7 +588,8 @@ async function applyHoldPayment(holdId: string, input: z.infer<typeof paymentSch
     customerId: hold.finalCustomerId ?? '',
     contactId: hold.contactId,
     amount: money(input.amount, input.currency),
-    note: input.note
+    note: input.note,
+    date: input.date
   });
   await addMovement({
     productId: hold.productId,
@@ -569,19 +606,20 @@ async function applyHoldPayment(holdId: string, input: z.infer<typeof paymentSch
     amount: payment.amount,
     partyId: payment.customerId || payment.contactId,
     memo: input.note || 'Hold payment',
-    date: payment.createdAt
+    date: payment.date || payment.createdAt
   });
 
   return { hold: enrichHold(nextHold), payment };
 }
 async function getInventoryCollections() {
-  const [productsSnapshot, holdsSnapshot, contactsSnapshot, salesSnapshot, paymentsSnapshot, categoriesSnapshot, rollsSnapshot, cutsSnapshot] =
+  const [productsSnapshot, holdsSnapshot, contactsSnapshot, salesSnapshot, paymentsSnapshot, debtInvoicesSnapshot, categoriesSnapshot, rollsSnapshot, cutsSnapshot] =
     await Promise.all([
       requireDb().ref('inventory/products').get(),
       requireDb().ref('inventory/holds').get(),
       requireDb().ref('inventory/contacts').get(),
       requireDb().ref('inventory/sales').get(),
       requireDb().ref('inventory/payments').get(),
+      requireDb().ref('inventory/customerDebtInvoices').get(),
       requireDb().ref('inventory/categories').get(),
       requireDb().ref('inventory/cableRolls').get(),
       requireDb().ref('inventory/cableCuts').get()
@@ -593,22 +631,81 @@ async function getInventoryCollections() {
     contacts: collectionToArray<Contact>(contactsSnapshot.val()),
     sales: collectionToArray<Sale>(salesSnapshot.val()),
     payments: collectionToArray<Payment>(paymentsSnapshot.val()),
+    customerDebtInvoices: collectionToArray<CustomerDebtInvoice>(debtInvoicesSnapshot.val()),
     categories: collectionToArray<Category>(categoriesSnapshot.val()),
     cableRolls: collectionToArray<CableRoll>(rollsSnapshot.val()),
     cableCuts: collectionToArray<CableCut>(cutsSnapshot.val())
   };
 }
 
+function uniqueById<T extends { id: string }>(items: T[]) {
+  return Array.from(new Map(items.map((item) => [item.id, item])).values());
+}
+
+function roundMoneyAmount(amount: number) {
+  return Number(amount.toFixed(2));
+}
+
 function buildPartyLedger(contactId: string, collections: Awaited<ReturnType<typeof getInventoryCollections>>) {
-  const holds = collections.holds.filter((hold) => hold.contactId === contactId).map(enrichHold);
+  const holds = collections.holds.filter((hold) => hold.contactId === contactId || hold.finalCustomerId === contactId).map(enrichHold);
   const salesAsResponsible = collections.sales.filter((sale) => sale.responsibleContactId === contactId).map(enrichSale);
   const salesAsCustomer = collections.sales.filter((sale) => sale.finalCustomerId === contactId).map(enrichSale);
+  const sales = uniqueById([...salesAsResponsible, ...salesAsCustomer]);
   const payments = collections.payments.filter((payment) => payment.contactId === contactId || payment.customerId === contactId || payment.targetId === contactId);
-  const holdBalances = holds.map((hold) => money(hold.balanceDue, hold.currency));
-  const saleBalances = [...salesAsResponsible, ...salesAsCustomer].map((sale) => sale.balanceDue);
-  const directCredits = payments
-    .filter((payment) => payment.targetType === 'customer' || payment.targetType === 'contact')
-    .map((payment) => money(-payment.amount.amount, payment.amount.currency));
+  const debtInvoices = collections.customerDebtInvoices.filter((invoice) => invoice.customerId === contactId);
+  const statementRows: Array<Omit<PartyStatementEntry, 'runningBalanceByCurrency'>> = [
+    ...debtInvoices.map((invoice) => ({
+      id: `debt-invoice-${invoice.id}`,
+      sourceType: 'debt_invoice' as const,
+      sourceId: invoice.id,
+      date: invoice.date || invoice.createdAt,
+      description: invoice.note || 'Customer debt invoice',
+      currency: invoice.amount.currency,
+      debit: invoice.amount
+    })),
+    ...sales.map((sale) => ({
+      id: `sale-${sale.id}`,
+      sourceType: 'sale' as const,
+      sourceId: sale.id,
+      date: sale.createdAt,
+      description: sale.note || 'Sale',
+      currency: sale.total.currency,
+      debit: sale.total
+    })),
+    ...holds
+      .filter((hold) => hold.quantitySold > 0)
+      .map((hold) => ({
+        id: `hold-${hold.id}`,
+        sourceType: 'hold' as const,
+        sourceId: hold.id,
+        date: hold.settledAt || hold.updatedAt || hold.createdAt,
+        description: hold.note || 'Hold sale',
+        currency: hold.currency,
+        debit: hold.amountDueMoney
+      })),
+    ...payments.map((payment) => ({
+      id: `payment-${payment.id}`,
+      sourceType: 'payment' as const,
+      sourceId: payment.id,
+      date: payment.date || payment.createdAt,
+      description: payment.note || 'Payment',
+      currency: payment.amount.currency,
+      credit: payment.amount
+    }))
+  ].sort((a, b) => {
+    const dateCompare = a.date.localeCompare(b.date);
+    return dateCompare === 0 ? a.id.localeCompare(b.id) : dateCompare;
+  });
+
+  const runningBalanceByCurrency: Record<Currency, number> = { USD: 0, SYP: 0 };
+  const statement = statementRows.map((row): PartyStatementEntry => {
+    if (row.debit) runningBalanceByCurrency[row.debit.currency] = roundMoneyAmount(runningBalanceByCurrency[row.debit.currency] + row.debit.amount);
+    if (row.credit) runningBalanceByCurrency[row.credit.currency] = roundMoneyAmount(runningBalanceByCurrency[row.credit.currency] - row.credit.amount);
+    return {
+      ...row,
+      runningBalanceByCurrency: { ...runningBalanceByCurrency }
+    };
+  });
 
   return {
     activeHolds: holds.filter((hold) => hold.status !== 'settled'),
@@ -616,7 +713,9 @@ function buildPartyLedger(contactId: string, collections: Awaited<ReturnType<typ
     salesAsResponsible,
     salesAsCustomer,
     payments,
-    balancesByCurrency: groupMoney([...holdBalances, ...saleBalances, ...directCredits]),
+    debtInvoices,
+    statement,
+    balancesByCurrency: { ...runningBalanceByCurrency },
     itemsInCustody: holds.reduce((sum, hold) => sum + hold.remainingQuantity, 0),
     soldQuantity: holds.reduce((sum, hold) => sum + hold.quantitySold, 0) + salesAsResponsible.reduce((sum, sale) => sum + sale.quantity, 0),
     collectedByCurrency: groupMoney(payments.map((payment) => payment.amount))
@@ -887,6 +986,36 @@ export async function inventoryRoutes(app: FastifyInstance) {
         ledger: buildPartyLedger(id, collections)
       }
     };
+  });
+
+  app.post('/customers/:id/debt-invoices', async (request, reply) => {
+    const { id } = z.object({ id: z.string().min(1) }).parse(request.params);
+    const input = customerDebtInvoiceCreateSchema.parse(request.body);
+    const customer = await getContact(id);
+    if (!customer || customer.type !== 'customer') throw new AppError('Customer not found', 404, 'CUSTOMER_NOT_FOUND');
+
+    const ref = requireDb().ref('inventory/customerDebtInvoices').push();
+    const invoice: Omit<CustomerDebtInvoice, 'id'> = {
+      customerId: id,
+      amount: money(input.amount, input.currency),
+      note: input.note,
+      date: input.date,
+      createdAt: now()
+    };
+
+    await ref.set(invoice);
+    await recordCustomerDebtInvoiceAccounting({
+      sourceId: ref.key!,
+      amount: invoice.amount,
+      partyId: id,
+      memo: input.note || 'Customer debt invoice',
+      date: invoice.date
+    });
+
+    return reply.status(201).send({
+      success: true,
+      data: { id: ref.key!, ...invoice }
+    });
   });
 
   app.get('/holds', async () => {
@@ -1177,20 +1306,43 @@ export async function inventoryRoutes(app: FastifyInstance) {
       return reply.status(201).send({ success: true, data: result });
     }
 
+    let targetId = input.targetId;
+    let customerId = input.customerId;
+    let contactId = input.contactId;
+
+    if (input.targetType === 'customer') {
+      customerId = customerId || targetId;
+      targetId = customerId;
+      const customer = await getContact(customerId);
+      if (!customer || customer.type !== 'customer') throw new AppError('Customer not found', 404, 'CUSTOMER_NOT_FOUND');
+      const collections = await getInventoryCollections();
+      const ledger = buildPartyLedger(customerId, collections);
+      if (input.amount > (ledger.balancesByCurrency[input.currency] ?? 0) + 0.009) {
+        throw new AppError('Payment exceeds customer balance', 400, 'PAYMENT_EXCEEDS_BALANCE');
+      }
+    }
+
+    if (input.targetType === 'contact') {
+      contactId = contactId || targetId;
+      targetId = contactId;
+      if (!(await getContact(contactId))) throw new AppError('Contact not found', 404, 'CONTACT_NOT_FOUND');
+    }
+
     const payment = await createPaymentRecord({
       targetType: input.targetType,
-      targetId: input.targetId,
-      customerId: input.customerId,
-      contactId: input.contactId,
+      targetId,
+      customerId,
+      contactId,
       amount: money(input.amount, input.currency),
-      note: input.note
+      note: input.note,
+      date: input.date
     });
     await recordPaymentAccounting({
       sourceId: payment.id,
       amount: payment.amount,
       partyId: payment.customerId || payment.contactId || payment.targetId,
       memo: input.note || 'Direct payment',
-      date: payment.createdAt
+      date: payment.date || payment.createdAt
     });
 
     return reply.status(201).send({
@@ -1412,6 +1564,10 @@ export async function inventoryRoutes(app: FastifyInstance) {
     const sales = collections.sales.map(enrichSale);
     const holdBalances = holds.map((hold) => money(hold.balanceDue, hold.currency));
     const saleBalances = sales.map((sale) => sale.balanceDue);
+    const invoiceBalances = collections.customerDebtInvoices.map((invoice) => invoice.amount);
+    const directPaymentCredits = collections.payments
+      .filter((payment) => payment.targetType === 'customer' || payment.targetType === 'contact')
+      .map((payment) => money(-payment.amount.amount, payment.amount.currency));
 
     return {
       success: true,
@@ -1424,7 +1580,7 @@ export async function inventoryRoutes(app: FastifyInstance) {
         stockOnHand: collections.products.reduce((sum, product) => sum + product.quantityOnHand, 0),
         stockOnHold: collections.products.reduce((sum, product) => sum + product.quantityOnHold, 0),
         activeHolds: holds.filter((hold) => hold.status !== 'settled').length,
-        unpaidBalance: groupMoney([...holdBalances, ...saleBalances])
+        unpaidBalance: groupMoney([...holdBalances, ...saleBalances, ...invoiceBalances, ...directPaymentCredits])
       }
     };
   });

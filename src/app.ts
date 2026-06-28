@@ -7,6 +7,7 @@ import { usersRoutes } from './modules/users/users.routes.js';
 import { firebaseRoutes } from './modules/firebase/firebase.routes.js';
 import { inventoryRoutes } from './modules/inventory/inventory.routes.js';
 import { accountingRoutes } from './modules/accounting/accounting.routes.js';
+import { serversRoutes } from './modules/servers/servers.routes.js';
 
 export async function buildApp() {
   const app = Fastify({
@@ -25,6 +26,7 @@ export async function buildApp() {
   await app.register(firebaseRoutes, { prefix: '/api' });
   await app.register(inventoryRoutes, { prefix: '/api' });
   await app.register(accountingRoutes, { prefix: '/api/accounting' });
+  await app.register(serversRoutes, { prefix: '/api' });
 
   app.get('/', async () => {
     return {
