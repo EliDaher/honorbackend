@@ -101,9 +101,27 @@ export const holdQuantitySchema = z.object({
   note: z.string().trim().optional().default('')
 });
 
+export const holdSellSchema = holdQuantitySchema.extend({
+  discountPerUnit: z.coerce.number().min(0).optional().default(0)
+});
+
+export const holdReceiptSellSchema = z.object({
+  finalCustomerId: z.string().trim().optional().default(''),
+  discountAmount: z.coerce.number().min(0).optional().default(0),
+  note: z.string().trim().optional().default('')
+});
+
 export const paymentSchema = z.object({
   amount: z.coerce.number().positive(),
   currency: currencySchema,
+  date: z.string().trim().optional(),
+  note: z.string().trim().optional().default('')
+});
+
+export const customerDebtInvoiceCreateSchema = z.object({
+  amount: z.coerce.number().positive(),
+  currency: currencySchema,
+  date: z.string().trim().optional(),
   note: z.string().trim().optional().default('')
 });
 

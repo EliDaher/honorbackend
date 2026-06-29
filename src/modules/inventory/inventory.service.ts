@@ -8,6 +8,7 @@ import type {
   Category,
   Contact,
   Currency,
+  CustomerDebtInvoice,
   Hold,
   HoldReceipt,
   Money,
@@ -31,6 +32,10 @@ export function now() {
 
 export function money(amount: number, currency: Currency): Money {
   return { amount: Number(amount.toFixed(2)), currency };
+}
+
+export function roundAmount(amount: number) {
+  return Number(amount.toFixed(2));
 }
 
 export function collectionToArray<T extends { id: string }>(value: Record<string, Omit<T, 'id'>> | null) {
@@ -63,17 +68,32 @@ export function normalizeProduct(id: string, value: Omit<Product, 'id'>): Produc
 }
 
 export function normalizeHold(id: string, value: Omit<Hold, 'id'>): Hold {
+  const { currency = 'USD', discountAmount = 0, ...rest } = value;
   return {
-    currency: 'USD',
-    ...value,
+    ...rest,
+    currency,
+    discountAmount,
     id
   };
 }
 
-export function calculateHoldStatus(hold: Pick<Hold, 'quantityHeld' | 'quantitySold' | 'quantityReturned' | 'unitPrice' | 'paidAmount'>) {
+export function getHoldGrossAmount(hold: Pick<Hold, 'quantitySold' | 'unitPrice'>) {
+  return roundAmount(hold.quantitySold * hold.unitPrice);
+}
+
+export function getHoldDiscountAmount(hold: Pick<Hold, 'quantitySold' | 'unitPrice'> & { discountAmount?: number }) {
+  const grossAmount = getHoldGrossAmount(hold);
+  return Math.min(grossAmount, Math.max(0, roundAmount(hold.discountAmount ?? 0)));
+}
+
+export function getHoldAmountDue(hold: Pick<Hold, 'quantitySold' | 'unitPrice'> & { discountAmount?: number }) {
+  return Math.max(0, roundAmount(getHoldGrossAmount(hold) - getHoldDiscountAmount(hold)));
+}
+
+export function calculateHoldStatus(hold: Pick<Hold, 'quantityHeld' | 'quantitySold' | 'quantityReturned' | 'unitPrice' | 'paidAmount'> & { discountAmount?: number }) {
   const remainingQuantity = hold.quantityHeld - hold.quantitySold - hold.quantityReturned;
-  const amountDue = hold.quantitySold * hold.unitPrice;
-  const balanceDue = Math.max(0, amountDue - hold.paidAmount);
+  const amountDue = getHoldAmountDue(hold);
+  const balanceDue = Math.max(0, roundAmount(amountDue - hold.paidAmount));
 
   if (remainingQuantity === 0 && balanceDue === 0) return 'settled' as const;
   if (hold.quantitySold > 0 && balanceDue > 0) return 'awaiting_payment' as const;
@@ -83,15 +103,21 @@ export function calculateHoldStatus(hold: Pick<Hold, 'quantityHeld' | 'quantityS
 export function enrichHold(hold: Hold) {
   const currency = hold.currency ?? 'USD';
   const remainingQuantity = hold.quantityHeld - hold.quantitySold - hold.quantityReturned;
-  const amountDue = hold.quantitySold * hold.unitPrice;
-  const balanceDue = Math.max(0, amountDue - hold.paidAmount);
+  const grossAmount = getHoldGrossAmount(hold);
+  const discountAmount = getHoldDiscountAmount(hold);
+  const amountDue = getHoldAmountDue(hold);
+  const balanceDue = Math.max(0, roundAmount(amountDue - hold.paidAmount));
 
   return {
     ...hold,
     currency,
+    discountAmount,
     remainingQuantity,
+    grossAmount,
     amountDue,
     balanceDue,
+    grossAmountMoney: money(grossAmount, currency),
+    discountAmountMoney: money(discountAmount, currency),
     amountDueMoney: money(amountDue, currency),
     balanceDueMoney: money(balanceDue, currency)
   };
@@ -258,6 +284,7 @@ export async function applySalePayment(saleId: string, input: PaymentInput) {
     customerId: sale.finalCustomerId,
     contactId: sale.responsibleContactId,
     amount: money(input.amount, input.currency),
+    date: input.date,
     note: input.note
   });
 
@@ -276,7 +303,7 @@ export async function applySalePayment(saleId: string, input: PaymentInput) {
     amount: payment.amount,
     partyId: payment.customerId || payment.contactId,
     memo: input.note || 'Sale payment',
-    date: payment.createdAt
+    date: payment.date || payment.createdAt
   });
 
   return { sale: enrichSale(nextSale), payment };
@@ -288,8 +315,8 @@ export async function applyHoldPayment(holdId: string, input: PaymentInput) {
   const holdCurrency = hold.currency ?? 'USD';
   if (holdCurrency !== input.currency) throw new AppError('Payment currency must match hold currency', 400, 'CURRENCY_MISMATCH');
 
-  const amountDue = hold.quantitySold * hold.unitPrice;
-  const balanceDue = Math.max(0, amountDue - hold.paidAmount);
+  const amountDue = getHoldAmountDue(hold);
+  const balanceDue = Math.max(0, roundAmount(amountDue - hold.paidAmount));
   if (input.amount > balanceDue) throw new AppError('Payment exceeds balance due', 400, 'PAYMENT_EXCEEDS_BALANCE');
 
   const timestamp = now();
@@ -311,6 +338,7 @@ export async function applyHoldPayment(holdId: string, input: PaymentInput) {
     customerId: hold.finalCustomerId ?? '',
     contactId: hold.contactId,
     amount: money(input.amount, input.currency),
+    date: input.date,
     note: input.note
   });
   await addMovement({
@@ -328,7 +356,7 @@ export async function applyHoldPayment(holdId: string, input: PaymentInput) {
     amount: payment.amount,
     partyId: payment.customerId || payment.contactId,
     memo: input.note || 'Hold payment',
-    date: payment.createdAt
+    date: payment.date || payment.createdAt
   });
 
   return { hold: enrichHold(nextHold), payment };
@@ -363,8 +391,8 @@ async function adjustHoldPaidAmount(holdId: string, delta: number, currency: Cur
   const holdCurrency = hold.currency ?? 'USD';
   if (holdCurrency !== currency) throw new AppError('Payment currency must match hold currency', 400, 'CURRENCY_MISMATCH');
 
-  const amountDue = hold.quantitySold * hold.unitPrice;
-  const currentBalance = Math.max(0, amountDue - hold.paidAmount);
+  const amountDue = getHoldAmountDue(hold);
+  const currentBalance = Math.max(0, roundAmount(amountDue - hold.paidAmount));
   if (delta > currentBalance) throw new AppError('Payment exceeds balance due', 400, 'PAYMENT_EXCEEDS_BALANCE');
   if (hold.paidAmount + delta < 0) throw new AppError('Payment cannot be lower than already reversed amount', 400, 'INVALID_PAYMENT_AMOUNT');
 
@@ -462,7 +490,7 @@ export async function deletePayment(paymentId: string) {
 }
 
 export async function getInventoryCollections() {
-  const [productsSnapshot, holdsSnapshot, holdReceiptsSnapshot, contactsSnapshot, salesSnapshot, paymentsSnapshot, categoriesSnapshot, rollsSnapshot, cutsSnapshot] =
+  const [productsSnapshot, holdsSnapshot, holdReceiptsSnapshot, contactsSnapshot, salesSnapshot, paymentsSnapshot, debtInvoicesSnapshot, categoriesSnapshot, rollsSnapshot, cutsSnapshot] =
     await Promise.all([
       requireDb().ref('inventory/products').get(),
       requireDb().ref('inventory/holds').get(),
@@ -470,6 +498,7 @@ export async function getInventoryCollections() {
       requireDb().ref('inventory/contacts').get(),
       requireDb().ref('inventory/sales').get(),
       requireDb().ref('inventory/payments').get(),
+      requireDb().ref('inventory/customerDebtInvoices').get(),
       requireDb().ref('inventory/categories').get(),
       requireDb().ref('inventory/cableRolls').get(),
       requireDb().ref('inventory/cableCuts').get()
@@ -482,22 +511,102 @@ export async function getInventoryCollections() {
     contacts: collectionToArray<Contact>(contactsSnapshot.val()),
     sales: collectionToArray<Sale>(salesSnapshot.val()),
     payments: collectionToArray<Payment>(paymentsSnapshot.val()),
+    debtInvoices: collectionToArray<CustomerDebtInvoice>(debtInvoicesSnapshot.val()),
     categories: collectionToArray<Category>(categoriesSnapshot.val()),
     cableRolls: collectionToArray<CableRoll>(rollsSnapshot.val()),
     cableCuts: collectionToArray<CableCut>(cutsSnapshot.val())
   };
 }
 
+function buildCustomerStatement(input: {
+  debtInvoices: CustomerDebtInvoice[];
+  holds: ReturnType<typeof enrichHold>[];
+  sales: ReturnType<typeof enrichSale>[];
+  payments: Payment[];
+}) {
+  const rows: Array<{
+    id: string;
+    sourceType: 'debt_invoice' | 'sale' | 'hold' | 'payment';
+    sourceId: string;
+    date: string;
+    description: string;
+    currency: Currency;
+    debit?: Money;
+    credit?: Money;
+    sortTime: string;
+  }> = [
+    ...input.debtInvoices.map((invoice) => ({
+      id: `debt-${invoice.id}`,
+      sourceType: 'debt_invoice' as const,
+      sourceId: invoice.id,
+      date: invoice.date || invoice.createdAt,
+      description: invoice.note || 'Customer debt invoice',
+      currency: invoice.amount.currency,
+      debit: invoice.amount,
+      sortTime: invoice.date || invoice.createdAt
+    })),
+    ...input.sales.map((sale) => ({
+      id: `sale-${sale.id}`,
+      sourceType: 'sale' as const,
+      sourceId: sale.id,
+      date: sale.createdAt,
+      description: sale.note || 'Sale',
+      currency: sale.total.currency,
+      debit: sale.total,
+      sortTime: sale.createdAt
+    })),
+    ...input.holds
+      .filter((hold) => hold.amountDue > 0)
+      .map((hold) => ({
+        id: `hold-${hold.id}`,
+        sourceType: 'hold' as const,
+        sourceId: hold.id,
+        date: hold.updatedAt || hold.createdAt,
+        description: hold.note || 'Hold sale',
+        currency: hold.currency,
+        debit: money(hold.amountDue, hold.currency),
+        sortTime: hold.updatedAt || hold.createdAt
+      })),
+    ...input.payments.map((payment) => ({
+      id: `payment-${payment.id}`,
+      sourceType: 'payment' as const,
+      sourceId: payment.id,
+      date: payment.date || payment.createdAt,
+      description: payment.note || 'Payment',
+      currency: payment.amount.currency,
+      credit: payment.amount,
+      sortTime: payment.date || payment.createdAt
+    }))
+  ].sort((a, b) => a.sortTime.localeCompare(b.sortTime));
+
+  const runningBalanceByCurrency: Record<Currency, number> = { USD: 0, SYP: 0 };
+  return rows.map(({ sortTime: _sortTime, ...row }) => {
+    runningBalanceByCurrency[row.currency] = roundAmount(runningBalanceByCurrency[row.currency] + (row.debit?.amount ?? 0) - (row.credit?.amount ?? 0));
+    return {
+      ...row,
+      runningBalanceByCurrency: { ...runningBalanceByCurrency }
+    };
+  });
+}
+
 export function buildPartyLedger(contactId: string, collections: Awaited<ReturnType<typeof getInventoryCollections>>) {
-  const holds = collections.holds.filter((hold) => hold.contactId === contactId).map(enrichHold);
+  const holds = collections.holds.filter((hold) => hold.contactId === contactId || hold.finalCustomerId === contactId).map(enrichHold);
   const salesAsResponsible = collections.sales.filter((sale) => sale.responsibleContactId === contactId).map(enrichSale);
   const salesAsCustomer = collections.sales.filter((sale) => sale.finalCustomerId === contactId).map(enrichSale);
   const payments = collections.payments.filter((payment) => payment.contactId === contactId || payment.customerId === contactId || payment.targetId === contactId);
+  const debtInvoices = collections.debtInvoices.filter((invoice) => invoice.customerId === contactId);
   const holdBalances = holds.map((hold) => money(hold.balanceDue, hold.currency));
   const saleBalances = [...salesAsResponsible, ...salesAsCustomer].map((sale) => sale.balanceDue);
+  const debtInvoiceBalances = debtInvoices.map((invoice) => invoice.amount);
   const directCredits = payments
     .filter((payment) => payment.targetType === 'customer' || payment.targetType === 'contact')
     .map((payment) => money(-payment.amount.amount, payment.amount.currency));
+  const statement = buildCustomerStatement({
+    debtInvoices,
+    holds,
+    sales: [...salesAsResponsible, ...salesAsCustomer],
+    payments
+  });
 
   return {
     activeHolds: holds.filter((hold) => hold.status !== 'settled'),
@@ -505,7 +614,9 @@ export function buildPartyLedger(contactId: string, collections: Awaited<ReturnT
     salesAsResponsible,
     salesAsCustomer,
     payments,
-    balancesByCurrency: groupMoney([...holdBalances, ...saleBalances, ...directCredits]),
+    debtInvoices,
+    statement,
+    balancesByCurrency: groupMoney([...holdBalances, ...saleBalances, ...debtInvoiceBalances, ...directCredits]),
     itemsInCustody: holds.reduce((sum, hold) => sum + hold.remainingQuantity, 0),
     soldQuantity: holds.reduce((sum, hold) => sum + hold.quantitySold, 0) + salesAsResponsible.reduce((sum, sale) => sum + sale.quantity, 0),
     collectedByCurrency: groupMoney(payments.map((payment) => payment.amount))

@@ -2,9 +2,9 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { AppError } from '../../../utils/app-error.js';
 import { recordSaleAccounting } from '../../accounting/accounting.service.js';
-import { holdCreateSchema, holdQuantitySchema, holdUpdateSchema, paymentSchema } from '../inventory.schema.js';
+import { holdCreateSchema, holdQuantitySchema, holdSellSchema, holdUpdateSchema, paymentSchema } from '../inventory.schema.js';
 import type { Hold } from '../inventory.types.js';
-import { addMovement, applyHoldPayment, calculateHoldStatus, collectionToArray, enrichHold, getContact, getHold, getHoldReceipt, getProduct, money, moveProductQuantity, normalizeHold, now, removeMovementsForReference, requireDb, withoutId } from '../inventory.service.js';
+import { addMovement, applyHoldPayment, calculateHoldStatus, collectionToArray, enrichHold, getContact, getHold, getHoldReceipt, getProduct, money, moveProductQuantity, normalizeHold, now, removeMovementsForReference, requireDb, roundAmount, withoutId } from '../inventory.service.js';
 
 export async function holdsRoutes(app: FastifyInstance) {
   app.get('/holds', async () => {
@@ -47,6 +47,7 @@ export async function holdsRoutes(app: FastifyInstance) {
       quantityReturned: 0,
       unitPrice: input.unitPrice,
       currency: input.currency,
+      discountAmount: 0,
       paidAmount: 0,
       status: 'active',
       note: input.note,
@@ -149,12 +150,14 @@ export async function holdsRoutes(app: FastifyInstance) {
 
   app.post('/holds/:id/sell', async (request) => {
     const { id } = z.object({ id: z.string().min(1) }).parse(request.params);
-    const input = holdQuantitySchema.parse(request.body);
+    const input = holdSellSchema.parse(request.body);
     const hold = await getHold(id);
     if (!hold) throw new AppError('Hold not found', 404, 'HOLD_NOT_FOUND');
+    if (input.finalCustomerId && !(await getContact(input.finalCustomerId))) throw new AppError('Final customer not found', 404, 'CUSTOMER_NOT_FOUND');
 
     const remainingQuantity = hold.quantityHeld - hold.quantitySold - hold.quantityReturned;
     if (input.quantity > remainingQuantity) throw new AppError('Sold quantity exceeds remaining held quantity', 400, 'INVALID_HOLD_QUANTITY');
+    if (input.discountPerUnit > hold.unitPrice) throw new AppError('Discount exceeds sale total', 400, 'DISCOUNT_EXCEEDS_TOTAL');
 
     const movement = await moveProductQuantity(hold.productId, (product) => ({
       ...product,
@@ -163,13 +166,18 @@ export async function holdsRoutes(app: FastifyInstance) {
     }));
 
     const timestamp = now();
+    const saleGrossAmount = roundAmount(input.quantity * hold.unitPrice);
+    const saleDiscountAmount = roundAmount(input.quantity * input.discountPerUnit);
+    const saleNetAmount = roundAmount(saleGrossAmount - saleDiscountAmount);
     const nextHold: Hold = {
       ...hold,
       finalCustomerId: input.finalCustomerId || hold.finalCustomerId,
       quantitySold: hold.quantitySold + input.quantity,
+      discountAmount: roundAmount((hold.discountAmount ?? 0) + saleDiscountAmount),
       status: calculateHoldStatus({
         ...hold,
-        quantitySold: hold.quantitySold + input.quantity
+        quantitySold: hold.quantitySold + input.quantity,
+        discountAmount: roundAmount((hold.discountAmount ?? 0) + saleDiscountAmount)
       }),
       updatedAt: timestamp
     };
@@ -194,7 +202,8 @@ export async function holdsRoutes(app: FastifyInstance) {
       productId: hold.productId,
       partyId: nextHold.finalCustomerId || nextHold.contactId,
       quantity: input.quantity,
-      total: money(input.quantity * hold.unitPrice, hold.currency ?? 'USD'),
+      total: money(saleNetAmount, hold.currency ?? 'USD'),
+      discount: money(saleDiscountAmount, hold.currency ?? 'USD'),
       costPerUnit: product?.costPrice ?? 0,
       costCurrency: product?.currency ?? hold.currency ?? 'USD',
       memo: input.note || 'Hold sale settled',

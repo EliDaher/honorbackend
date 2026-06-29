@@ -84,6 +84,7 @@ type Hold = {
   quantitySold: number;
   unitPrice: number;
   currency?: Currency;
+  discountAmount?: number;
   paidAmount: number;
   note: string;
   createdAt: string;
@@ -147,6 +148,7 @@ const accountIds = {
   payable: 'accounts_payable',
   openingEquity: 'opening_balance_equity',
   revenue: 'sales_revenue',
+  salesDiscounts: 'sales_discounts',
   cogs: 'cost_of_goods_sold',
   expenses: 'operating_expenses'
 } as const;
@@ -158,6 +160,7 @@ const defaultAccounts: Account[] = [
   { id: accountIds.payable, code: '2000', name: 'Accounts Payable', type: 'liability', description: 'Unpaid purchases and expenses.', system: true, createdAt: '', updatedAt: '' },
   { id: accountIds.openingEquity, code: '3000', name: 'Opening Balance Equity', type: 'equity', description: 'Historical inventory value introduced during backfill.', system: true, createdAt: '', updatedAt: '' },
   { id: accountIds.revenue, code: '4000', name: 'Sales Revenue', type: 'income', description: 'Revenue from product, hold, and cable sales.', system: true, createdAt: '', updatedAt: '' },
+  { id: accountIds.salesDiscounts, code: '4100', name: 'Sales Discounts', type: 'income', description: 'Contra revenue from discounts granted on sales.', system: true, createdAt: '', updatedAt: '' },
   { id: accountIds.cogs, code: '5000', name: 'Cost of Goods Sold', type: 'expense', description: 'Inventory cost consumed by sales.', system: true, createdAt: '', updatedAt: '' },
   { id: accountIds.expenses, code: '6000', name: 'Operating Expenses', type: 'expense', description: 'Manual operating expenses.', system: true, createdAt: '', updatedAt: '' }
 ];
@@ -343,16 +346,26 @@ export async function recordSaleAccounting(input: {
   partyId?: string;
   quantity: number;
   total: Money;
+  discount?: Money;
   costPerUnit?: number;
   costCurrency?: Currency;
   memo?: string;
   date?: string;
 }) {
-  if (input.total.amount <= 0) return null;
-  const lines: JournalLineInput[] = [
-    { accountId: accountIds.receivable, debit: input.total.amount, currency: input.total.currency, partyId: input.partyId, description: 'Amount due from sale' },
-    { accountId: accountIds.revenue, credit: input.total.amount, currency: input.total.currency, partyId: input.partyId, description: 'Sales revenue' }
-  ];
+  if (input.discount && input.discount.currency !== input.total.currency) throw new AppError('Discount currency must match sale currency', 400, 'CURRENCY_MISMATCH');
+
+  const discountAmount = round(input.discount?.amount ?? 0);
+  const grossAmount = round(input.total.amount + discountAmount);
+  if (grossAmount <= 0) return null;
+
+  const lines: JournalLineInput[] = [];
+  if (input.total.amount > 0) {
+    lines.push({ accountId: accountIds.receivable, debit: input.total.amount, currency: input.total.currency, partyId: input.partyId, description: 'Amount due from sale' });
+  }
+  if (discountAmount > 0) {
+    lines.push({ accountId: accountIds.salesDiscounts, debit: discountAmount, currency: input.total.currency, partyId: input.partyId, description: 'Sales discount' });
+  }
+  lines.push({ accountId: accountIds.revenue, credit: grossAmount, currency: input.total.currency, partyId: input.partyId, description: 'Sales revenue before discount' });
 
   const costAmount = round((input.costPerUnit ?? 0) * input.quantity);
   const costCurrency = input.costCurrency ?? input.total.currency;
@@ -705,7 +718,9 @@ export async function getFinancialStatements() {
     return map;
   }, {});
 
-  const revenue = byId[accountIds.revenue]?.balance ?? emptyCurrencyMap();
+  const grossRevenue = byId[accountIds.revenue]?.balance ?? emptyCurrencyMap();
+  const salesDiscounts = byId[accountIds.salesDiscounts]?.balance ?? emptyCurrencyMap();
+  const revenue = { USD: round(grossRevenue.USD + salesDiscounts.USD), SYP: round(grossRevenue.SYP + salesDiscounts.SYP) };
   const cogs = byId[accountIds.cogs]?.balance ?? emptyCurrencyMap();
   const operatingExpenses = byId[accountIds.expenses]?.balance ?? emptyCurrencyMap();
   const grossProfit = { USD: round(revenue.USD - cogs.USD), SYP: round(revenue.SYP - cogs.SYP) };
@@ -723,6 +738,8 @@ export async function getFinancialStatements() {
     generatedAt: now(),
     profitAndLoss: {
       revenue,
+      grossRevenue,
+      salesDiscounts,
       cogs,
       grossProfit,
       operatingExpenses,
@@ -851,6 +868,8 @@ export async function runAccountingBackfill() {
     if ((hold.quantitySold ?? 0) <= 0) continue;
     const product = collections.products.find((item) => item.id === hold.productId);
     const currency = hold.currency ?? 'USD';
+    const grossAmount = round(hold.quantitySold * hold.unitPrice);
+    const discountAmount = Math.min(grossAmount, Math.max(0, round(hold.discountAmount ?? 0)));
     await count(await recordSaleAccounting({
       sourceType: 'hold',
       sourceId: hold.id,
@@ -858,7 +877,8 @@ export async function runAccountingBackfill() {
       productId: hold.productId,
       partyId: hold.finalCustomerId || hold.contactId,
       quantity: hold.quantitySold,
-      total: money(hold.quantitySold * hold.unitPrice, currency),
+      total: money(grossAmount - discountAmount, currency),
+      discount: money(discountAmount, currency),
       costPerUnit: product?.costPrice ?? 0,
       costCurrency: product?.currency ?? currency,
       memo: hold.note || 'Backfilled hold settlement',

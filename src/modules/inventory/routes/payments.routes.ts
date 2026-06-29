@@ -35,6 +35,7 @@ export async function paymentsRoutes(app: FastifyInstance) {
       customerId: input.customerId,
       contactId: input.contactId,
       amount: money(input.amount, input.currency),
+      date: input.date,
       note: input.note
     });
     await recordPaymentAccounting({
@@ -42,7 +43,7 @@ export async function paymentsRoutes(app: FastifyInstance) {
       amount: payment.amount,
       partyId: payment.customerId || payment.contactId || payment.targetId,
       memo: input.note || 'Direct payment',
-      date: payment.createdAt
+      date: payment.date || payment.createdAt
     });
 
     return reply.status(201).send({

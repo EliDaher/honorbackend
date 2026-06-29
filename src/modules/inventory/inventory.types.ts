@@ -52,6 +52,7 @@ export type Hold = {
   quantityReturned: number;
   unitPrice: number;
   currency?: Currency;
+  discountAmount: number;
   paidAmount: number;
   status: 'active' | 'awaiting_payment' | 'settled';
   note: string;
@@ -97,6 +98,16 @@ export type Payment = {
   contactId: string;
   amount: Money;
   note: string;
+  date?: string;
+  createdAt: string;
+};
+
+export type CustomerDebtInvoice = {
+  id: string;
+  customerId: string;
+  amount: Money;
+  note: string;
+  date: string;
   createdAt: string;
 };
 
