@@ -334,6 +334,21 @@ export async function serversRoutes(app: FastifyInstance) {
     };
   });
 
+  app.get('/servers/:id/neighbors', async (request) => {
+    const { id } = z.object({ id: z.string().min(1) }).parse(request.params);
+    const server = await getServer(id);
+    if (!server) throw new AppError('Server not found', 404, 'SERVER_NOT_FOUND');
+    const result = await fetchRouterJson(server, '/ip/neighbor');
+
+    return {
+      success: true,
+      data: {
+        fetchedAt: now(),
+        result: Array.isArray(result) ? result : []
+      }
+    };
+  });
+
   app.post('/servers/:id/ping', async (request) => {
     const { id } = z.object({ id: z.string().min(1) }).parse(request.params);
     const input = pingSchema.parse(request.body);
