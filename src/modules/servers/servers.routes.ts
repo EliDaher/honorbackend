@@ -2,7 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { db } from '../../config/firebase.js';
 import { AppError } from '../../utils/app-error.js';
-import { requireAuth } from '../auth/auth.middleware.js';
+import { requireRole } from '../auth/auth.middleware.js';
 
 type ManagedServer = {
   id: string;
@@ -255,7 +255,7 @@ async function fetchRouterJson(server: ManagedServer, path: string, init: Reques
 }
 
 export async function serversRoutes(app: FastifyInstance) {
-  app.addHook('preHandler', requireAuth);
+  app.addHook('preHandler', requireRole(['admin']));
 
   app.get('/servers', async () => {
     const snapshot = await requireDb().ref('network/servers').get();

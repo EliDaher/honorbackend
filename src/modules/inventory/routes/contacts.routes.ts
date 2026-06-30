@@ -41,9 +41,10 @@ export async function contactsRoutes(app: FastifyInstance) {
       const collections = await getInventoryCollections();
       const hasInventoryReference =
         collections.holds.some((hold) => hold.contactId === id || hold.finalCustomerId === id) ||
-        collections.sales.some((sale) => sale.responsibleContactId === id || sale.finalCustomerId === id) ||
-        collections.payments.some((payment) => payment.contactId === id || payment.customerId === id || payment.targetId === id) ||
-        collections.cableCuts.some((cut) => cut.responsibleContactId === id || cut.finalCustomerId === id);
+      collections.sales.some((sale) => sale.responsibleContactId === id || sale.finalCustomerId === id) ||
+      collections.payments.some((payment) => payment.contactId === id || payment.customerId === id || payment.targetId === id) ||
+      collections.cableCuts.some((cut) => cut.responsibleContactId === id || cut.finalCustomerId === id) ||
+      collections.holdRequests.some((holdRequest) => holdRequest.workerContactId === id);
       if (hasInventoryReference) throw new AppError('Contact type cannot be changed while it has related records', 400, 'CONTACT_TYPE_IN_USE');
     }
 
@@ -81,6 +82,7 @@ export async function contactsRoutes(app: FastifyInstance) {
       collections.sales.some((sale) => sale.responsibleContactId === id || sale.finalCustomerId === id) ||
       collections.payments.some((payment) => payment.contactId === id || payment.customerId === id || payment.targetId === id) ||
       collections.cableCuts.some((cut) => cut.responsibleContactId === id || cut.finalCustomerId === id) ||
+      collections.holdRequests.some((holdRequest) => holdRequest.workerContactId === id) ||
       expenses.some((expense) => expense.vendorContactId === id) ||
       purchases.some((purchase) => purchase.supplierContactId === id);
 

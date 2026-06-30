@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { requireAuth } from '../auth/auth.middleware.js';
+import { requireRole } from '../auth/auth.middleware.js';
 import { expenseCreateSchema, expenseUpdateSchema, purchaseCreateSchema, purchaseUpdateSchema } from './accounting.schema.js';
 import {
   createExpense,
@@ -19,7 +19,7 @@ import {
 } from './accounting.service.js';
 
 export async function accountingRoutes(app: FastifyInstance) {
-  app.addHook('preHandler', requireAuth);
+  app.addHook('preHandler', requireRole(['admin']));
 
   app.get('/accounts', async () => ({
     success: true,

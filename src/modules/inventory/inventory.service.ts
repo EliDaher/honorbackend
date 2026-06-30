@@ -11,6 +11,7 @@ import type {
   CustomerDebtInvoice,
   Hold,
   HoldReceipt,
+  HoldRequest,
   Money,
   MovementType,
   Payment,
@@ -121,6 +122,131 @@ export function enrichHold(hold: Hold) {
     amountDueMoney: money(amountDue, currency),
     balanceDueMoney: money(balanceDue, currency)
   };
+}
+
+type EnrichedHold = ReturnType<typeof enrichHold>;
+
+export function receiptNumber() {
+  return `HR-${Date.now().toString(36).toUpperCase()}`;
+}
+
+export function receiptStatus(items: EnrichedHold[]) {
+  if (items.length > 0 && items.every((item) => item.status === 'settled')) return 'settled' as const;
+  if (items.some((item) => item.status === 'awaiting_payment')) return 'awaiting_payment' as const;
+  return 'active' as const;
+}
+
+export function enrichHoldReceipt(receipt: HoldReceipt, holds: Hold[]) {
+  const holdById = new Map(holds.map((hold) => [hold.id, hold]));
+  const itemIds = receipt.itemIds ?? [];
+  const orderedItems = itemIds.length > 0 ? itemIds.map((itemId) => holdById.get(itemId)).filter(Boolean) : holds.filter((hold) => hold.receiptId === receipt.id);
+  const items = (orderedItems as Hold[]).map(enrichHold);
+
+  return {
+    ...receipt,
+    itemIds,
+    items,
+    itemCount: items.length,
+    remainingQuantity: items.reduce((sum, item) => sum + item.remainingQuantity, 0),
+    balancesDue: groupMoney(items.map((item) => ({ amount: item.balanceDue, currency: item.currency }))),
+    status: receiptStatus(items)
+  };
+}
+
+export async function createHoldReceipt(input: {
+  contactId: string;
+  finalCustomerId?: string;
+  note: string;
+  items: Array<{
+    productId: string;
+    quantity: number;
+    unitPrice: number;
+    currency: Currency;
+    note: string;
+  }>;
+}) {
+  const contact = await getContact(input.contactId);
+  if (!contact) throw new AppError('Contact not found', 404, 'CONTACT_NOT_FOUND');
+  if (input.finalCustomerId && !(await getContact(input.finalCustomerId))) throw new AppError('Final customer not found', 404, 'CUSTOMER_NOT_FOUND');
+
+  const products = new Map<string, Product>();
+  const requestedByProduct = new Map<string, number>();
+
+  for (const item of input.items) {
+    const product = products.get(item.productId) ?? (await getProduct(item.productId));
+    if (!product) throw new AppError('Product not found', 404, 'PRODUCT_NOT_FOUND');
+    products.set(item.productId, product);
+    requestedByProduct.set(item.productId, (requestedByProduct.get(item.productId) ?? 0) + item.quantity);
+  }
+
+  for (const [productId, quantity] of requestedByProduct.entries()) {
+    const product = products.get(productId);
+    if (!product || product.quantityOnHand < quantity) throw new AppError('Not enough quantity on hand', 400, 'INSUFFICIENT_STOCK');
+  }
+
+  const db = requireDb();
+  const receiptRef = db.ref('inventory/holdReceipts').push();
+  const receiptId = receiptRef.key!;
+  const timestamp = now();
+  const itemIds: string[] = [];
+  const holds: Hold[] = [];
+
+  for (const item of input.items) {
+    const holdRef = db.ref('inventory/holds').push();
+    const movement = await moveProductQuantity(item.productId, (current) => {
+      if (current.quantityOnHand < item.quantity) return;
+      return {
+        ...current,
+        quantityOnHand: current.quantityOnHand - item.quantity,
+        quantityOnHold: current.quantityOnHold + item.quantity,
+        updatedAt: now()
+      };
+    });
+    const hold: Omit<Hold, 'id'> = {
+      receiptId,
+      productId: item.productId,
+      contactId: input.contactId,
+      finalCustomerId: input.finalCustomerId || undefined,
+      quantityHeld: item.quantity,
+      quantitySold: 0,
+      quantityReturned: 0,
+      unitPrice: item.unitPrice,
+      currency: item.currency,
+      discountAmount: 0,
+      paidAmount: 0,
+      status: 'active',
+      note: item.note,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    };
+
+    await holdRef.set(hold);
+    await addMovement({
+      productId: item.productId,
+      type: 'hold_out',
+      quantity: item.quantity,
+      beforeQuantity: movement.beforeQuantity,
+      afterQuantity: movement.afterQuantity,
+      referenceType: 'hold',
+      referenceId: holdRef.key!,
+      note: item.note || input.note
+    });
+    itemIds.push(holdRef.key!);
+    holds.push({ id: holdRef.key!, ...hold });
+  }
+
+  const receipt: Omit<HoldReceipt, 'id'> = {
+    receiptNumber: receiptNumber(),
+    contactId: input.contactId,
+    finalCustomerId: input.finalCustomerId || undefined,
+    itemIds,
+    note: input.note,
+    createdAt: timestamp,
+    updatedAt: timestamp
+  };
+  await receiptRef.set(receipt);
+
+  return enrichHoldReceipt({ id: receiptId, ...receipt }, holds);
 }
 
 export function calculateSaleStatus(total: Money, paidAmount: Money) {
@@ -490,11 +616,12 @@ export async function deletePayment(paymentId: string) {
 }
 
 export async function getInventoryCollections() {
-  const [productsSnapshot, holdsSnapshot, holdReceiptsSnapshot, contactsSnapshot, salesSnapshot, paymentsSnapshot, debtInvoicesSnapshot, categoriesSnapshot, rollsSnapshot, cutsSnapshot] =
+  const [productsSnapshot, holdsSnapshot, holdReceiptsSnapshot, holdRequestsSnapshot, contactsSnapshot, salesSnapshot, paymentsSnapshot, debtInvoicesSnapshot, categoriesSnapshot, rollsSnapshot, cutsSnapshot] =
     await Promise.all([
       requireDb().ref('inventory/products').get(),
       requireDb().ref('inventory/holds').get(),
       requireDb().ref('inventory/holdReceipts').get(),
+      requireDb().ref('inventory/holdRequests').get(),
       requireDb().ref('inventory/contacts').get(),
       requireDb().ref('inventory/sales').get(),
       requireDb().ref('inventory/payments').get(),
@@ -508,6 +635,7 @@ export async function getInventoryCollections() {
     products: collectionToArray<Product>(productsSnapshot.val()).map((product) => normalizeProduct(product.id, withoutId(product) as Omit<Product, 'id'>)),
     holds: collectionToArray<Hold>(holdsSnapshot.val()).map((hold) => normalizeHold(hold.id, withoutId(hold) as Omit<Hold, 'id'>)),
     holdReceipts: collectionToArray<HoldReceipt>(holdReceiptsSnapshot.val()),
+    holdRequests: collectionToArray<HoldRequest>(holdRequestsSnapshot.val()),
     contacts: collectionToArray<Contact>(contactsSnapshot.val()),
     sales: collectionToArray<Sale>(salesSnapshot.val()),
     payments: collectionToArray<Payment>(paymentsSnapshot.val()),
@@ -596,6 +724,9 @@ export function buildPartyLedger(contactId: string, collections: Awaited<ReturnT
   const payments = collections.payments.filter((payment) => payment.contactId === contactId || payment.customerId === contactId || payment.targetId === contactId);
   const debtInvoices = collections.debtInvoices.filter((invoice) => invoice.customerId === contactId);
   const holdBalances = holds.map((hold) => money(hold.balanceDue, hold.currency));
+  const custodyValues = holds
+    .filter((hold) => hold.status !== 'settled' && hold.remainingQuantity > 0)
+    .map((hold) => money(roundAmount(hold.remainingQuantity * hold.unitPrice), hold.currency));
   const saleBalances = [...salesAsResponsible, ...salesAsCustomer].map((sale) => sale.balanceDue);
   const debtInvoiceBalances = debtInvoices.map((invoice) => invoice.amount);
   const directCredits = payments
@@ -617,6 +748,7 @@ export function buildPartyLedger(contactId: string, collections: Awaited<ReturnT
     debtInvoices,
     statement,
     balancesByCurrency: groupMoney([...holdBalances, ...saleBalances, ...debtInvoiceBalances, ...directCredits]),
+    custodyValueByCurrency: groupMoney(custodyValues),
     itemsInCustody: holds.reduce((sum, hold) => sum + hold.remainingQuantity, 0),
     soldQuantity: holds.reduce((sum, hold) => sum + hold.quantitySold, 0) + salesAsResponsible.reduce((sum, sale) => sum + sale.quantity, 0),
     collectedByCurrency: groupMoney(payments.map((payment) => payment.amount))

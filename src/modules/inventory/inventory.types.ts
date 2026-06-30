@@ -72,6 +72,33 @@ export type HoldReceipt = {
   updatedAt: string;
 };
 
+export type HoldRequestItem = {
+  productId: string;
+  quantity: number;
+  unitPrice: number;
+  currency: Currency;
+  note: string;
+};
+
+export type HoldRequest = {
+  id: string;
+  workerContactId: string;
+  requestedByUserId: string;
+  requestedByUsername: string;
+  items: HoldRequestItem[];
+  status: 'pending' | 'approved' | 'rejected' | 'canceled';
+  note: string;
+  adminNote: string;
+  holdReceiptId?: string;
+  createdAt: string;
+  updatedAt: string;
+  approvedAt?: string;
+  approvedBy?: string;
+  rejectedAt?: string;
+  rejectedBy?: string;
+  canceledAt?: string;
+};
+
 export type Sale = {
   id: string;
   productId: string;

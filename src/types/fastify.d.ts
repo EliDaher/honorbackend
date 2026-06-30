@@ -5,12 +5,14 @@ declare module '@fastify/jwt' {
     payload: {
       id: string;
       username: string;
-      role: 'admin' | 'employee' | 'user';
+      role: 'admin' | 'worker' | 'employee' | 'user';
+      contactId?: string;
     };
     user: {
       id: string;
       username: string;
-      role: 'admin' | 'employee' | 'user';
+      role: 'admin' | 'worker' | 'employee' | 'user';
+      contactId?: string;
     };
   }
 }

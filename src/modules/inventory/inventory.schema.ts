@@ -83,6 +83,40 @@ export const holdReceiptCreateSchema = z.object({
     .min(1)
 });
 
+export const holdRequestCreateSchema = z.object({
+  workerContactId: z.string().trim().optional().default(''),
+  note: z.string().trim().optional().default(''),
+  items: z
+    .array(
+      z.object({
+        productId: z.string().trim().min(1),
+        quantity: z.coerce.number().int().positive(),
+        note: z.string().trim().optional().default('')
+      })
+    )
+    .min(1)
+});
+
+export const holdRequestApprovalSchema = z.object({
+  adminNote: z.string().trim().optional().default(''),
+  items: z
+    .array(
+      z.object({
+        productId: z.string().trim().min(1),
+        quantity: z.coerce.number().int().positive(),
+        unitPrice: z.coerce.number().min(0),
+        currency: currencySchema,
+        note: z.string().trim().optional().default('')
+      })
+    )
+    .min(1)
+    .optional()
+});
+
+export const holdRequestRejectionSchema = z.object({
+  adminNote: z.string().trim().optional().default('')
+});
+
 export const holdUpdateSchema = z
   .object({
     contactId: z.string().trim().min(1).optional(),
