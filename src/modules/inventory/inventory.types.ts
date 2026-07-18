@@ -174,6 +174,9 @@ export type CableCut = {
 export type MovementType =
   | 'create_product'
   | 'stock_in'
+  | 'stock_out'
+  | 'stock_adjustment'
+  | 'purchase_in'
   | 'hold_out'
   | 'hold_sell'
   | 'hold_return'

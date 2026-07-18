@@ -44,6 +44,18 @@ export const stockSchema = z.object({
   note: z.string().trim().optional().default('')
 });
 
+export const inventoryMovementCreateSchema = z
+  .object({
+    date: z.string().trim().optional(),
+    productId: z.string().trim().min(1),
+    type: z.enum(['stock_in', 'stock_out', 'stock_adjustment']),
+    quantity: z.coerce.number().int().nonnegative(),
+    note: z.string().trim().optional().default('')
+  })
+  .refine((value) => value.type === 'stock_adjustment' || value.quantity > 0, {
+    message: 'Quantity must be positive for stock in and stock out'
+  });
+
 export const contactCreateSchema = z.object({
   type: z.enum(['dealer', 'customer', 'worker', 'supplier']),
   name: z.string().trim().min(1),
@@ -245,3 +257,4 @@ export const cableCutSchema = z.object({
 });
 
 export type PaymentInput = z.infer<typeof paymentSchema>;
+export type InventoryMovementCreateInput = z.infer<typeof inventoryMovementCreateSchema>;

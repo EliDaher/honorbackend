@@ -141,6 +141,23 @@ type Purchase = {
   createdAt: string;
 };
 
+type FinancialTransactionType = 'receipt' | 'payment' | 'expense';
+type PaymentMethod = 'cash' | 'transfer' | 'card';
+type PartyType = 'customer' | 'supplier' | 'other';
+
+type FinancialTransaction = {
+  id: string;
+  date: string;
+  type: FinancialTransactionType;
+  amount: Money;
+  partyType: PartyType;
+  partyId: string;
+  note: string;
+  paymentMethod: PaymentMethod;
+  createdBy: string;
+  createdAt: string;
+};
+
 const accountIds = {
   cash: 'cash',
   receivable: 'accounts_receivable',
@@ -148,9 +165,11 @@ const accountIds = {
   payable: 'accounts_payable',
   openingEquity: 'opening_balance_equity',
   revenue: 'sales_revenue',
+  otherIncome: 'other_income',
   salesDiscounts: 'sales_discounts',
   cogs: 'cost_of_goods_sold',
-  expenses: 'operating_expenses'
+  expenses: 'operating_expenses',
+  generalPayments: 'general_payments'
 } as const;
 
 const defaultAccounts: Account[] = [
@@ -160,9 +179,11 @@ const defaultAccounts: Account[] = [
   { id: accountIds.payable, code: '2000', name: 'Accounts Payable', type: 'liability', description: 'Unpaid purchases and expenses.', system: true, createdAt: '', updatedAt: '' },
   { id: accountIds.openingEquity, code: '3000', name: 'Opening Balance Equity', type: 'equity', description: 'Historical inventory value introduced during backfill.', system: true, createdAt: '', updatedAt: '' },
   { id: accountIds.revenue, code: '4000', name: 'Sales Revenue', type: 'income', description: 'Revenue from product, hold, and cable sales.', system: true, createdAt: '', updatedAt: '' },
+  { id: accountIds.otherIncome, code: '4200', name: 'Other Income', type: 'income', description: 'Manual receipts that are not tied to an existing receivable.', system: true, createdAt: '', updatedAt: '' },
   { id: accountIds.salesDiscounts, code: '4100', name: 'Sales Discounts', type: 'income', description: 'Contra revenue from discounts granted on sales.', system: true, createdAt: '', updatedAt: '' },
   { id: accountIds.cogs, code: '5000', name: 'Cost of Goods Sold', type: 'expense', description: 'Inventory cost consumed by sales.', system: true, createdAt: '', updatedAt: '' },
-  { id: accountIds.expenses, code: '6000', name: 'Operating Expenses', type: 'expense', description: 'Manual operating expenses.', system: true, createdAt: '', updatedAt: '' }
+  { id: accountIds.expenses, code: '6000', name: 'Operating Expenses', type: 'expense', description: 'Manual operating expenses.', system: true, createdAt: '', updatedAt: '' },
+  { id: accountIds.generalPayments, code: '6100', name: 'General Payments', type: 'expense', description: 'Manual cash payments not tied to an existing payable.', system: true, createdAt: '', updatedAt: '' }
 ];
 
 function requireDb() {
@@ -532,10 +553,149 @@ export async function deleteExpense(expenseId: string) {
   return { id: expenseId };
 }
 
+function financialTransactionMemo(transaction: Pick<FinancialTransaction, 'type' | 'note'>) {
+  if (transaction.note) return transaction.note;
+  if (transaction.type === 'receipt') return 'Manual receipt';
+  if (transaction.type === 'payment') return 'Manual payment';
+  return 'Manual expense';
+}
+
+async function postFinancialTransactionJournal(transaction: FinancialTransaction) {
+  const partyId = transaction.partyId || '';
+  const amount = transaction.amount.amount;
+  const currency = transaction.amount.currency;
+
+  if (transaction.type === 'receipt') {
+    return postJournalEntry({
+      sourceType: 'financial_transaction',
+      sourceId: transaction.id,
+      sourceAction: transaction.type,
+      memo: financialTransactionMemo(transaction),
+      partyId,
+      date: transaction.date,
+      lines: [
+        { accountId: accountIds.cash, debit: amount, currency, partyId, description: 'Manual receipt' },
+        { accountId: partyId ? accountIds.receivable : accountIds.otherIncome, credit: amount, currency, partyId, description: partyId ? 'Receivable collected' : 'Other income' }
+      ]
+    });
+  }
+
+  return postJournalEntry({
+    sourceType: 'financial_transaction',
+    sourceId: transaction.id,
+    sourceAction: transaction.type,
+    memo: financialTransactionMemo(transaction),
+    partyId,
+    date: transaction.date,
+    lines: [
+      { accountId: transaction.type === 'expense' ? accountIds.expenses : partyId ? accountIds.payable : accountIds.generalPayments, debit: amount, currency, partyId, description: transaction.type === 'expense' ? 'Manual expense' : partyId ? 'Payable paid' : 'Manual payment' },
+      { accountId: accountIds.cash, credit: amount, currency, partyId, description: 'Cash paid' }
+    ]
+  });
+}
+
+export async function createFinancialTransaction(input: {
+  date?: string;
+  type: FinancialTransactionType;
+  amount: number;
+  currency: Currency;
+  partyType: PartyType;
+  partyId?: string;
+  note?: string;
+  paymentMethod: PaymentMethod;
+  createdBy?: string;
+}) {
+  const timestamp = now();
+  const ref = requireDb().ref('accounting/financialTransactions').push();
+  const transaction: FinancialTransaction = {
+    id: ref.key!,
+    date: input.date || timestamp,
+    type: input.type,
+    amount: money(input.amount, input.currency),
+    partyType: input.partyType,
+    partyId: input.partyId ?? '',
+    note: input.note ?? '',
+    paymentMethod: input.paymentMethod,
+    createdBy: input.createdBy ?? '',
+    createdAt: timestamp
+  };
+
+  await ref.set(transaction);
+  await postFinancialTransactionJournal(transaction);
+  return transaction;
+}
+
+export async function getFinancialTransactions() {
+  const snapshot = await requireDb().ref('accounting/financialTransactions').get();
+  return collectionToArray<FinancialTransaction>(snapshot.val()).sort((a, b) => (b.date || b.createdAt).localeCompare(a.date || a.createdAt));
+}
+
+export function summarizeFinancialTransactions(transactions: FinancialTransaction[]) {
+  const totals = {
+    receipt: emptyCurrencyMap(),
+    payment: emptyCurrencyMap(),
+    expense: emptyCurrencyMap(),
+    balance: emptyCurrencyMap()
+  };
+
+  for (const transaction of transactions) {
+    const amount = transaction.amount.amount;
+    const currency = transaction.amount.currency;
+    addAmount(totals[transaction.type], currency, amount);
+    addAmount(totals.balance, currency, transaction.type === 'receipt' ? amount : -amount);
+  }
+
+  return totals;
+}
+
 async function getProduct(productId: string) {
   const snapshot = await requireDb().ref(`inventory/products/${productId}`).get();
   const product = snapshot.val() as Omit<Product, 'id'> | null;
   return product ? ({ id: productId, ...product } as Product) : null;
+}
+
+async function removeInventoryMovementsForReference(referenceType: string, referenceId: string) {
+  const movementsRef = requireDb().ref('inventory/movements');
+  const snapshot = await movementsRef.get();
+  const movements = (snapshot.val() ?? {}) as Record<string, { referenceType?: string; referenceId?: string }>;
+  const updates: Record<string, null> = {};
+
+  for (const [id, movement] of Object.entries(movements)) {
+    if (movement.referenceType === referenceType && movement.referenceId === referenceId) {
+      updates[id] = null;
+    }
+  }
+
+  if (Object.keys(updates).length > 0) await movementsRef.update(updates);
+}
+
+async function recordPurchaseInventoryMovement(input: {
+  purchaseId: string;
+  productId: string;
+  quantity: number;
+  beforeQuantity: number;
+  afterQuantity: number;
+  note: string;
+  date: string;
+}) {
+  const ref = requireDb().ref('inventory/movements').push();
+  const movement = {
+    id: ref.key!,
+    productId: input.productId,
+    type: 'purchase_in',
+    quantity: input.quantity,
+    beforeQuantity: input.beforeQuantity,
+    afterQuantity: input.afterQuantity,
+    referenceType: 'purchase',
+    referenceId: input.purchaseId,
+    note: input.note,
+    date: input.date,
+    createdBy: '',
+    createdAt: now()
+  };
+
+  await ref.set(movement);
+  return movement;
 }
 
 export async function createPurchase(input: {
@@ -571,6 +731,15 @@ export async function createPurchase(input: {
     quantityOnHand: (product.quantityOnHand ?? 0) + input.quantity,
     costPrice: input.unitCost,
     updatedAt: timestamp
+  });
+  await recordPurchaseInventoryMovement({
+    purchaseId: purchase.id,
+    productId: purchase.productId,
+    quantity: purchase.quantity,
+    beforeQuantity: product.quantityOnHand ?? 0,
+    afterQuantity: (product.quantityOnHand ?? 0) + purchase.quantity,
+    note: purchase.note || 'Stock purchase',
+    date: timestamp
   });
 
   await postPurchaseJournal(purchase);
@@ -638,6 +807,16 @@ export async function updatePurchase(purchaseId: string, input: {
     costPrice: nextUnitCost,
     updatedAt: now()
   });
+  await removeInventoryMovementsForReference('purchase', purchaseId);
+  await recordPurchaseInventoryMovement({
+    purchaseId,
+    productId: existing.productId,
+    quantity: next.quantity,
+    beforeQuantity: (product.quantityOnHand ?? 0) + quantityDelta - next.quantity,
+    afterQuantity: (product.quantityOnHand ?? 0) + quantityDelta,
+    note: next.note || 'Stock purchase',
+    date: next.createdAt
+  });
   await deleteJournalEntry('purchase', purchaseId, existing.paidStatus);
   await postPurchaseJournal(next);
   return next;
@@ -658,6 +837,7 @@ export async function deletePurchase(purchaseId: string) {
     quantityOnHand: (product.quantityOnHand ?? 0) - existing.quantity,
     updatedAt: now()
   });
+  await removeInventoryMovementsForReference('purchase', purchaseId);
   await deleteJournalEntry('purchase', purchaseId, existing.paidStatus);
   return { id: purchaseId };
 }
@@ -678,8 +858,8 @@ export async function getPurchases() {
 }
 
 async function getAccountingCollections() {
-  const [accounts, journalEntries, expenses, purchases] = await Promise.all([getAccounts(), getJournalEntries(), getExpenses(), getPurchases()]);
-  return { accounts, journalEntries, expenses, purchases };
+  const [accounts, journalEntries, expenses, purchases, financialTransactions] = await Promise.all([getAccounts(), getJournalEntries(), getExpenses(), getPurchases(), getFinancialTransactions()]);
+  return { accounts, journalEntries, expenses, purchases, financialTransactions };
 }
 
 function calculateAccountBalances(accounts: Account[], entries: JournalEntry[]) {
@@ -718,11 +898,15 @@ export async function getFinancialStatements() {
     return map;
   }, {});
 
-  const grossRevenue = byId[accountIds.revenue]?.balance ?? emptyCurrencyMap();
+  const salesRevenue = byId[accountIds.revenue]?.balance ?? emptyCurrencyMap();
+  const otherIncome = byId[accountIds.otherIncome]?.balance ?? emptyCurrencyMap();
+  const grossRevenue = { USD: round(salesRevenue.USD + otherIncome.USD), SYP: round(salesRevenue.SYP + otherIncome.SYP) };
   const salesDiscounts = byId[accountIds.salesDiscounts]?.balance ?? emptyCurrencyMap();
   const revenue = { USD: round(grossRevenue.USD + salesDiscounts.USD), SYP: round(grossRevenue.SYP + salesDiscounts.SYP) };
   const cogs = byId[accountIds.cogs]?.balance ?? emptyCurrencyMap();
-  const operatingExpenses = byId[accountIds.expenses]?.balance ?? emptyCurrencyMap();
+  const directExpenses = byId[accountIds.expenses]?.balance ?? emptyCurrencyMap();
+  const generalPayments = byId[accountIds.generalPayments]?.balance ?? emptyCurrencyMap();
+  const operatingExpenses = { USD: round(directExpenses.USD + generalPayments.USD), SYP: round(directExpenses.SYP + generalPayments.SYP) };
   const grossProfit = { USD: round(revenue.USD - cogs.USD), SYP: round(revenue.SYP - cogs.SYP) };
   const netProfit = { USD: round(grossProfit.USD - operatingExpenses.USD), SYP: round(grossProfit.SYP - operatingExpenses.SYP) };
 
@@ -739,6 +923,7 @@ export async function getFinancialStatements() {
     profitAndLoss: {
       revenue,
       grossRevenue,
+      otherIncome,
       salesDiscounts,
       cogs,
       grossProfit,
@@ -762,11 +947,12 @@ export async function getFinancialStatements() {
 }
 
 export async function getAccountingDashboard() {
-  const [{ journalEntries, expenses, purchases }, statements] = await Promise.all([getAccountingCollections(), getFinancialStatements()]);
+  const [{ journalEntries, expenses, purchases, financialTransactions }, statements] = await Promise.all([getAccountingCollections(), getFinancialStatements()]);
   const balances = statements.accountBalances.reduce<Record<string, Record<Currency, number>>>((map, row) => {
     map[row.account.id] = row.balance;
     return map;
   }, {});
+  const financialTransactionSummary = summarizeFinancialTransactions(financialTransactions);
 
   return {
     generatedAt: now(),
@@ -781,11 +967,13 @@ export async function getAccountingDashboard() {
       expenses: statements.profitAndLoss.operatingExpenses,
       netProfit: statements.profitAndLoss.netProfit
     },
+    financialTransactions: financialTransactionSummary,
     counts: {
       journalEntries: journalEntries.length,
       unbalancedEntries: journalEntries.filter((entry) => !entry.balanced).length,
       expenses: expenses.length,
-      purchases: purchases.length
+      purchases: purchases.length,
+      financialTransactions: financialTransactions.length
     },
     recentEntries: journalEntries.slice(0, 8)
   };

@@ -19,6 +19,23 @@ import type {
   Sale
 } from './inventory.types.js';
 
+export type InventoryMovementReferenceType = 'product' | 'hold' | 'payment' | 'sale' | 'cableRoll' | 'cableCut' | 'manual' | 'purchase';
+
+export type InventoryMovement = {
+  id: string;
+  productId: string;
+  type: MovementType;
+  quantity: number;
+  beforeQuantity: number;
+  afterQuantity: number;
+  referenceType: InventoryMovementReferenceType;
+  referenceId: string;
+  note: string;
+  date: string;
+  createdBy: string;
+  createdAt: string;
+};
+
 export function requireDb() {
   if (!db) {
     throw new AppError('Firebase Realtime Database is not configured', 503, 'FIREBASE_NOT_CONFIGURED');
@@ -323,18 +340,28 @@ export async function addMovement(input: {
   quantity: number;
   beforeQuantity: number;
   afterQuantity: number;
-  referenceType: 'product' | 'hold' | 'payment' | 'sale' | 'cableRoll' | 'cableCut';
+  referenceType: InventoryMovementReferenceType;
   referenceId: string;
   note: string;
+  date?: string;
+  createdBy?: string;
 }) {
   const ref = requireDb().ref('inventory/movements').push();
-  const movement = {
+  const timestamp = now();
+  const movement: InventoryMovement = {
     id: ref.key!,
     ...input,
-    createdAt: now()
+    date: input.date || timestamp,
+    createdBy: input.createdBy ?? '',
+    createdAt: timestamp
   };
   await ref.set(movement);
   return movement;
+}
+
+export async function getInventoryMovements() {
+  const snapshot = await requireDb().ref('inventory/movements').get();
+  return collectionToArray<InventoryMovement>(snapshot.val()).sort((a, b) => (b.date || b.createdAt).localeCompare(a.date || a.createdAt));
 }
 
 export async function removeMovementsForReference(referenceType: string, referenceId: string) {
@@ -369,6 +396,64 @@ export async function moveProductQuantity(
     product: normalizeProduct(productId, next),
     beforeQuantity,
     afterQuantity: next.quantityOnHand
+  };
+}
+
+export async function createManualInventoryMovement(input: {
+  date?: string;
+  productId: string;
+  type: 'stock_in' | 'stock_out' | 'stock_adjustment';
+  quantity: number;
+  note?: string;
+  createdBy?: string;
+}) {
+  if (input.type === 'stock_out') {
+    const product = await getProduct(input.productId);
+    if (!product) throw new AppError('Product not found', 404, 'PRODUCT_NOT_FOUND');
+    if (product.quantityOnHand < input.quantity) throw new AppError('Cannot remove quantity greater than available stock', 400, 'INSUFFICIENT_STOCK');
+  }
+
+  const movementResult = await moveProductQuantity(input.productId, (product) => {
+    if (input.type === 'stock_in') {
+      return {
+        ...product,
+        quantityOnHand: product.quantityOnHand + input.quantity,
+        updatedAt: now()
+      };
+    }
+
+    if (input.type === 'stock_out') {
+      if (product.quantityOnHand < input.quantity) return;
+      return {
+        ...product,
+        quantityOnHand: product.quantityOnHand - input.quantity,
+        updatedAt: now()
+      };
+    }
+
+    return {
+      ...product,
+      quantityOnHand: input.quantity,
+      updatedAt: now()
+    };
+  });
+
+  const movement = await addMovement({
+    productId: input.productId,
+    type: input.type,
+    quantity: input.type === 'stock_adjustment' ? Math.abs(movementResult.afterQuantity - movementResult.beforeQuantity) : input.quantity,
+    beforeQuantity: movementResult.beforeQuantity,
+    afterQuantity: movementResult.afterQuantity,
+    referenceType: 'manual',
+    referenceId: input.productId,
+    note: input.note ?? '',
+    date: input.date,
+    createdBy: input.createdBy
+  });
+
+  return {
+    product: movementResult.product,
+    movement
   };
 }
 

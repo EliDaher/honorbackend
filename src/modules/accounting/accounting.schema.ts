@@ -2,6 +2,9 @@ import { z } from 'zod';
 
 export const currencySchema = z.enum(['USD', 'SYP']).default('USD');
 export const paidStatusSchema = z.enum(['paid', 'unpaid']).default('paid');
+export const financialTransactionTypeSchema = z.enum(['receipt', 'payment', 'expense']);
+export const paymentMethodSchema = z.enum(['cash', 'transfer', 'card']).default('cash');
+export const partyTypeSchema = z.enum(['customer', 'supplier', 'other']).default('other');
 
 export const expenseCreateSchema = z.object({
   category: z.string().trim().min(1).default('Operating expense'),
@@ -33,7 +36,19 @@ export const purchaseUpdateSchema = purchaseCreateSchema
     message: 'At least one field is required'
   });
 
+export const financialTransactionCreateSchema = z.object({
+  date: z.string().trim().optional(),
+  type: financialTransactionTypeSchema,
+  amount: z.coerce.number().positive(),
+  currency: currencySchema,
+  partyType: partyTypeSchema,
+  partyId: z.string().trim().optional().default(''),
+  note: z.string().trim().optional().default(''),
+  paymentMethod: paymentMethodSchema
+});
+
 export type ExpenseCreateInput = z.infer<typeof expenseCreateSchema>;
 export type ExpenseUpdateInput = z.infer<typeof expenseUpdateSchema>;
 export type PurchaseCreateInput = z.infer<typeof purchaseCreateSchema>;
 export type PurchaseUpdateInput = z.infer<typeof purchaseUpdateSchema>;
+export type FinancialTransactionCreateInput = z.infer<typeof financialTransactionCreateSchema>;

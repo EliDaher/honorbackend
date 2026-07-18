@@ -8,6 +8,7 @@ import { dashboardRoutes } from './routes/dashboard.routes.js';
 import { holdReceiptsRoutes } from './routes/hold-receipts.routes.js';
 import { holdRequestsRoutes } from './routes/hold-requests.routes.js';
 import { holdsRoutes } from './routes/holds.routes.js';
+import { inventoryMovementsRoutes } from './routes/inventory-movements.routes.js';
 import { paymentsRoutes } from './routes/payments.routes.js';
 import { productsRoutes } from './routes/products.routes.js';
 import { salesRoutes } from './routes/sales.routes.js';
@@ -33,6 +34,7 @@ export async function inventoryRoutes(app: FastifyInstance) {
     await adminApp.register(salesRoutes);
     await adminApp.register(paymentsRoutes);
     await adminApp.register(cablesRoutes);
+    await adminApp.register(inventoryMovementsRoutes);
     await adminApp.register(dashboardRoutes);
   });
 }

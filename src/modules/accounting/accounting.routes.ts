@@ -1,15 +1,17 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { requireRole } from '../auth/auth.middleware.js';
-import { expenseCreateSchema, expenseUpdateSchema, purchaseCreateSchema, purchaseUpdateSchema } from './accounting.schema.js';
+import { expenseCreateSchema, expenseUpdateSchema, financialTransactionCreateSchema, purchaseCreateSchema, purchaseUpdateSchema } from './accounting.schema.js';
 import {
   createExpense,
+  createFinancialTransaction,
   createPurchase,
   deleteExpense,
   deletePurchase,
   getAccountingDashboard,
   getAccounts,
   getExpenses,
+  getFinancialTransactions,
   getFinancialStatements,
   getJournalEntries,
   getPurchases,
@@ -45,6 +47,20 @@ export async function accountingRoutes(app: FastifyInstance) {
     success: true,
     data: await getExpenses()
   }));
+
+  app.get('/financial-transactions', async () => ({
+    success: true,
+    data: await getFinancialTransactions()
+  }));
+
+  app.post('/financial-transactions', async (request, reply) => {
+    const input = financialTransactionCreateSchema.parse(request.body);
+    const transaction = await createFinancialTransaction({
+      ...input,
+      createdBy: request.user.username || request.user.id
+    });
+    return reply.status(201).send({ success: true, data: transaction });
+  });
 
   app.post('/expenses', async (request, reply) => {
     const input = expenseCreateSchema.parse(request.body);
