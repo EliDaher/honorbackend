@@ -31,6 +31,8 @@ type ServerPingSummary = {
   status: PingStatus;
 };
 
+type RouterRow = Record<string, unknown>;
+
 const serverCreateSchema = z.object({
   name: z.string().trim().min(1),
   apiBaseUrl: z.string().trim().min(1),
@@ -54,6 +56,10 @@ const serverUpdateSchema = z
 const pingSchema = z.object({
   address: z.string().trim().min(1),
   count: z.coerce.number().int().min(1).max(20)
+});
+
+const interfaceSearchSchema = z.object({
+  interfaceName: z.string().trim().min(1)
 });
 
 function requireDb() {
@@ -158,6 +164,19 @@ function collectPingRows(result: unknown): Record<string, unknown>[] {
   return [object, ...nestedRows];
 }
 
+function isRouterRow(value: unknown): value is RouterRow {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function routerRows(result: unknown) {
+  if (Array.isArray(result)) return result.filter(isRouterRow);
+  return isRouterRow(result) ? [result] : [];
+}
+
+function exactNameMatches(rows: RouterRow[], name: string) {
+  return rows.filter((row) => String(row.name ?? '').trim() === name);
+}
+
 function numberFromRows(rows: Record<string, unknown>[], fields: string[], direction: 'first' | 'last' = 'first') {
   const orderedRows = direction === 'last' ? [...rows].reverse() : rows;
 
@@ -254,6 +273,57 @@ async function fetchRouterJson(server: ManagedServer, path: string, init: Reques
   }
 }
 
+async function searchServerInterface(server: ManagedServer, interfaceName: string) {
+  const fetchedAt = now();
+  const printBody = JSON.stringify({ '.query': [`name=${interfaceName}`] });
+  const printInit = {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: printBody
+  };
+
+  try {
+    const [interfacesResult, activeSessionsResult] = await Promise.allSettled([
+      fetchRouterJson(server, '/interface/print', printInit),
+      fetchRouterJson(server, '/ppp/active/print', printInit)
+    ]);
+
+    if (interfacesResult.status === 'rejected') {
+      throw interfacesResult.reason;
+    }
+
+    const matches = exactNameMatches(routerRows(interfacesResult.value), interfaceName);
+    const activeSessions =
+      activeSessionsResult.status === 'fulfilled'
+        ? exactNameMatches(routerRows(activeSessionsResult.value), interfaceName)
+        : [];
+
+    return {
+      server: safeServer(server),
+      matches,
+      activeSessions,
+      status: matches.length > 0 || activeSessions.length > 0 ? 'matched' : 'no_match',
+      fetchedAt
+    };
+  } catch (requestError) {
+    const error =
+      requestError instanceof AppError
+        ? { code: requestError.code, message: requestError.message }
+        : { code: 'SERVER_SEARCH_FAILED', message: 'Server interface search failed' };
+
+    return {
+      server: safeServer(server),
+      matches: [],
+      activeSessions: [],
+      status: 'error',
+      error,
+      fetchedAt
+    };
+  }
+}
+
 export async function serversRoutes(app: FastifyInstance) {
   app.addHook('preHandler', requireRole(['admin']));
 
@@ -284,6 +354,22 @@ export async function serversRoutes(app: FastifyInstance) {
       success: true,
       data: safeServer({ id: ref.key!, ...server })
     });
+  });
+
+  app.post('/servers/interface-search', async (request) => {
+    const input = interfaceSearchSchema.parse(request.body);
+    const snapshot = await requireDb().ref('network/servers').get();
+    const servers = collectionToArray<ManagedServer>(snapshot.val());
+    const results = await Promise.all(servers.map((server) => searchServerInterface(server, input.interfaceName)));
+
+    return {
+      success: true,
+      data: {
+        interfaceName: input.interfaceName,
+        fetchedAt: now(),
+        results
+      }
+    };
   });
 
   app.patch('/servers/:id', async (request) => {
